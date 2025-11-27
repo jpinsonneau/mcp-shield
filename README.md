@@ -1,5 +1,9 @@
 # MCP Shield
 
+<div align="center">
+  <img src="logo.png" alt="MCP Shield Logo" width="400">
+</div>
+
 MCP Shield is an OAuth proxy for MCP servers on OpenShift. It provides OAuth 2.0 discovery, client registration, and token exchange for MCP servers such as [prometheus-mcp-server](https://github.com/tjhop/prometheus-mcp-server), with OpenShift-specific handling and a proxy token system for enhanced security.
 
 > **Note**: MCP Shield has been tested with Claude (Anthropic's AI assistant) as an MCP client. The implementation is designed to work with any MCP client that follows the OAuth 2.0 flow with Bearer token authentication.
