@@ -101,6 +101,10 @@ spec:
           # In a sidecar setup, this should point to the main container's port
           - name: MCP_BACKEND_URL
             value: "http://localhost:8080"  # Points to prometheus-mcp-server container in the same pod
+          # MCP_BACKEND_PATH is the endpoint path to forward requests to
+          # For Prometheus MCP server, use /mcp (default)
+          - name: MCP_BACKEND_PATH
+            value: "/mcp"  # Prometheus MCP server uses /mcp endpoint
         livenessProbe:
           httpGet:
             path: /healthz

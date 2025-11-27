@@ -1,0 +1,157 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: loki-mcp-server
+  namespace: default
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: loki-mcp-server
+  namespace: default
+  labels:
+    app: loki-mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: loki-mcp-server
+  template:
+    metadata:
+      labels:
+        app: loki-mcp-server
+    spec:
+      serviceAccountName: loki-mcp-server
+      containers:
+      # Main loki-mcp-server container
+      # Note: The loki-mcp image is not available in a public registry.
+      # You need to build it from source: https://github.com/grafana/loki-mcp
+      # Build command: docker build -t <your-registry>/loki-mcp:dev .
+      # Then push to your registry and update the image below.
+      - name: loki-mcp-server
+        image: quay.io/jpinsonn/loki-mcp:dev  # Replace with your built image
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        env:
+          # Loki connection configuration
+          - name: LOKI_URL
+            value: "http://loki.netobserv.svc.cluster.local:3100"  # Adjust to your Loki URL
+          # Organization ID for multi-tenant Loki (optional)
+          - name: LOKI_ORG_ID
+            value: ""  # Set if using multi-tenant Loki
+          # Authentication
+          #- name: LOKI_TOKEN
+          #  value: ""  # Will be set by MCP Shield via Authorization header
+        # Health probes using TCP socket check since Loki MCP server doesn't expose HTTP health endpoints
+        # The /sse and /mcp endpoints are for streaming/protocol use, not health checks
+        livenessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+      # MCP Shield sidecar container
+      - name: mcp-shield
+        image: quay.io/jpinsonn/mcp-shield:dev
+        args:
+          - '--listen=:8081'
+          - '--log-level=info'
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8081
+          name: oauth
+        env:
+          # OAuth Configuration
+          # OAUTH_AUTHORIZATION_SERVERS should point to the public URL where MCP Shield is accessible
+          - name: OAUTH_AUTHORIZATION_SERVERS
+            value: "https://loki-mcp-server.apps.PLACEHOLDER"
+          # INSPECTOR_ORIGIN is the origin of the MCP Inspector (for CORS headers)
+          - name: INSPECTOR_ORIGIN
+            value: "https://mcp-inspector.apps.PLACEHOLDER"
+          # OAUTH_CLIENT_ID must match the OAuthClient name in OpenShift
+          - name: OAUTH_CLIENT_ID
+            value: "loki-mcp-server"
+          # OAUTH_REDIRECT_URIS (optional) - comma-separated list of additional redirect URIs
+          # Default redirect URIs are automatically generated from OAUTH_AUTHORIZATION_SERVERS and INSPECTOR_ORIGIN
+          # - name: OAUTH_REDIRECT_URIS
+          #   value: "https://custom-redirect.example.com/callback"
+          # OpenShift OAuth Token Exchange Configuration
+          # OPENSHIFT_OAUTH_TOKEN_URL will be auto-derived from OAUTH_AUTHORIZATION_SERVERS if not set
+          - name: OPENSHIFT_OAUTH_TOKEN_URL
+            value: ""  # Leave empty to auto-derive from OAUTH_AUTHORIZATION_SERVERS
+          # MCP Backend Configuration
+          # MCP_BACKEND_URL is the URL of the MCP server container (defaults to http://localhost:8080)
+          # In a sidecar setup, this should point to the main container's port
+          - name: MCP_BACKEND_URL
+            value: "http://localhost:8080"  # Points to loki-mcp-server container in the same pod
+          # MCP_BACKEND_PATH is the endpoint path to forward requests to
+          # For Loki MCP server, use /stream (HTTP endpoint), /mcp is for SSE
+          - name: MCP_BACKEND_PATH
+            value: "/stream"  # Loki MCP server uses /stream for HTTP requests
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: loki-mcp-server
+  namespace: default
+  labels:
+    app: loki-mcp-server
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: loki-mcp-server-tls
+spec:
+  selector:
+    app: loki-mcp-server
+  ports:
+    # Expose MCP Shield port (clients connect here)
+    - port: 8081
+      targetPort: 8081
+      protocol: TCP
+      name: oauth
+    # Also expose direct MCP port (optional, for internal use)
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: mcp
+---
+#apiVersion: v1
+#kind: Secret
+#metadata:
+#  name: loki-mcp-server-auth
+#  namespace: default
+#type: Opaque
+#stringData:
+#  password: ""  # Set if using basic auth with Loki
+---
+# OAuth Client configuration (create this using oc command or apply separately)
+# Example command to create OAuth client:
+# oc create -f - <<EOF
+# apiVersion: oauth.openshift.io/v1
+# kind: OAuthClient
+# metadata:
+#   name: loki-mcp-server
+# grantMethod: auto
+# redirectURIs:
+#   - "https://loki-mcp-server.default.svc:8081/oauth/callback"
+#   - "https://loki-mcp-server.apps.<YOUR_CLUSTER_DOMAIN>/oauth/callback"
+# EOF
+
