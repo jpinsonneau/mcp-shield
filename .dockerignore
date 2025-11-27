@@ -1,0 +1,35 @@
+# Git (large directory, not needed for build)
+.git
+.gitignore
+
+# Examples and documentation (not needed for build)
+examples/
+*.md
+!README.md
+
+# Build artifacts (not needed for build)
+mcp-shield
+*.exe
+*.test
+*.out
+
+# IDE files (not needed for build)
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files (not needed for build)
+.DS_Store
+Thumbs.db
+
+# Temporary files (not needed for build)
+tmp/
+temp/
+*.log
+
+# Other files not needed for build
+Makefile
+.dockerignore
+

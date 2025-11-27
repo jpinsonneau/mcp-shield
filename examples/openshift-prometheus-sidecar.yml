@@ -1,0 +1,200 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus-mcp-server
+  namespace: default
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: prometheus-mcp-server
+subjects:
+  - kind: ServiceAccount
+    name: prometheus-mcp-server
+    namespace: default
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: cluster-monitoring-view
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus-mcp-server
+  namespace: default
+  labels:
+    app: prometheus-mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: prometheus-mcp-server
+  template:
+    metadata:
+      labels:
+        app: prometheus-mcp-server
+    spec:
+      serviceAccountName: prometheus-mcp-server
+      containers:
+      # Main prometheus-mcp-server container (no OAuth code)
+      - name: prometheus-mcp-server
+        image: ghcr.io/tjhop/prometheus-mcp-server:latest
+        args: 
+          - '--prometheus.url=https://thanos-querier.openshift-monitoring.svc:9091'
+          - '--http.config=/etc/configs/prom-config.yaml'
+          - '--mcp.transport=http'
+          - '--web.listen-address=:8080'
+          - '--web.config.file=/etc/configs/web-config.yaml'
+          - '--log.level=info'
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        volumeMounts:
+            - mountPath: /etc/configs
+              name: configs
+            - mountPath: /var/certs
+              name: certs
+        livenessProbe:
+          httpGet:
+            path: /metrics
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /metrics
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      # MCP Shield sidecar container
+      - name: mcp-shield
+        image: quay.io/jpinsonn/mcp-shield:dev
+        args:
+          - '--listen=:8081'
+          - '--log-level=info'
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8081
+          name: oauth
+        env:
+          # OAuth Configuration
+          # OAUTH_AUTHORIZATION_SERVERS should point to the public URL where MCP Shield is accessible
+          - name: OAUTH_AUTHORIZATION_SERVERS
+            value: "https://prometheus-mcp-server.apps.PLACEHOLDER"
+          # INSPECTOR_ORIGIN is the origin of the MCP Inspector (for CORS headers)
+          - name: INSPECTOR_ORIGIN
+            value: "https://mcp-inspector.apps.PLACEHOLDER"
+          # OAUTH_CLIENT_ID must match the OAuthClient name in OpenShift
+          - name: OAUTH_CLIENT_ID
+            value: "prometheus-mcp-server"
+          # OAUTH_REDIRECT_URIS (optional) - comma-separated list of additional redirect URIs
+          # Default redirect URIs are automatically generated from OAUTH_AUTHORIZATION_SERVERS and INSPECTOR_ORIGIN
+          # - name: OAUTH_REDIRECT_URIS
+          #   value: "https://custom-redirect.example.com/callback"
+          # OpenShift OAuth Token Exchange Configuration
+          # OPENSHIFT_OAUTH_TOKEN_URL will be auto-derived from OAUTH_AUTHORIZATION_SERVERS if not set
+          - name: OPENSHIFT_OAUTH_TOKEN_URL
+            value: ""  # Leave empty to auto-derive from OAUTH_AUTHORIZATION_SERVERS
+          # MCP Backend Configuration
+          # MCP_BACKEND_URL is the URL of the MCP server container (defaults to http://localhost:8080)
+          # In a sidecar setup, this should point to the main container's port
+          - name: MCP_BACKEND_URL
+            value: "http://localhost:8080"  # Points to prometheus-mcp-server container in the same pod
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+        - name: configs
+          configMap:
+            name: prometheus-mcp-server
+        - name: certs
+          secret:
+            secretName: prometheus-mcp-server-tls
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: prometheus-mcp-server
+  namespace: default
+  labels:
+    app: prometheus-mcp-server
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: prometheus-mcp-server-tls
+spec:
+  selector:
+    app: prometheus-mcp-server
+  ports:
+    # Expose MCP Shield port (clients connect here)
+    - port: 8081
+      targetPort: 8081
+      protocol: TCP
+      name: oauth
+    # Also expose direct MCP port (optional, for internal use)
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: mcp
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-mcp-server
+  namespace: default
+  labels:
+    app: prometheus-mcp-server
+data:
+  prom-config.yaml: |
+    # Prometheus HTTP config file
+    # https://prometheus.io/docs/prometheus/latest/configuration/configuration/#http_config
+
+    # MCP Shield handles authentication, so we don't need service account token here
+    # The MCP Shield sidecar will inject OAuth tokens into requests
+
+    # Use the service account CA for TLS verification
+    tls_config:
+      ca_file: /var/run/secrets/kubernetes.io/serviceaccount/service-ca.crt
+  web-config.yaml: |
+    # HTTP server config file
+    # https://github.com/prometheus/exporter-toolkit/blob/master/docs/web-configuration.md
+
+    # TLS disabled for internal cluster communication
+    # Gateway handles TLS termination at the edge
+    # tls_server_config:
+    #   cert_file: /var/certs/tls.crt
+    #   key_file: /var/certs/tls.key
+  openshift-api-url: "https://api.example.com:6443"  # Replace with your OpenShift API URL
+  oauth-redirect-uri: "https://prometheus-mcp-server.default.svc:8081/oauth/callback"  # Adjust based on your service URL
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: prometheus-mcp-server-oauth
+  namespace: default
+type: Opaque
+stringData:
+  client-id: "prometheus-mcp-server"  # Replace with your OAuth client ID
+  client-secret: ""  # Optional: only needed for confidential clients
+---
+# OAuth Client configuration (create this using oc command or apply separately)
+# Example command to create OAuth client:
+# oc create -f - <<EOF
+# apiVersion: oauth.openshift.io/v1
+# kind: OAuthClient
+# metadata:
+#   name: prometheus-mcp-server
+# grantMethod: auto
+# redirectURIs:
+#   - "https://prometheus-mcp-server.default.svc:8081/oauth/callback"
+#   - "http://localhost:8081/oauth/callback"  # For local development
+# EOF
+
