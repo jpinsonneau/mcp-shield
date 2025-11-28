@@ -234,9 +234,6 @@ cleanup_deployment() {
     # Delete service account
     oc delete serviceaccount "$SERVICE_NAME" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
     
-    # Delete cluster role binding
-    oc delete clusterrolebinding "$SERVICE_NAME" --ignore-not-found=true 2>/dev/null || true
-    
     # Delete OAuthClient
     print_status "Deleting OAuthClient..."
     oc delete oauthclient "$OAUTH_CLIENT_ID" --ignore-not-found=true 2>/dev/null || true

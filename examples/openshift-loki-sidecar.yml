@@ -3,6 +3,11 @@ kind: ServiceAccount
 metadata:
   name: loki-mcp-server
   namespace: default
+  # Note: No ClusterRoleBinding needed!
+  # loki-mcp-server uses Bearer tokens from the Authorization header (user's OAuth token)
+  # for all Loki API operations, not the ServiceAccount token.
+  # The ServiceAccount is only needed for the pod to run.
+  # All permissions come from the user's OAuth token that MCP Shield forwards.
 ---
 apiVersion: apps/v1
 kind: Deployment

@@ -3,19 +3,11 @@ kind: ServiceAccount
 metadata:
   name: prometheus-mcp-server
   namespace: default
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: prometheus-mcp-server
-subjects:
-  - kind: ServiceAccount
-    name: prometheus-mcp-server
-    namespace: default
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: cluster-monitoring-view
+  # Note: No ClusterRoleBinding needed!
+  # prometheus-mcp-server uses Bearer tokens from the Authorization header (user's OAuth token)
+  # for all Prometheus API operations, not the ServiceAccount token.
+  # The ServiceAccount is only needed for the pod to run.
+  # All permissions come from the user's OAuth token that MCP Shield forwards.
 ---
 apiVersion: apps/v1
 kind: Deployment
