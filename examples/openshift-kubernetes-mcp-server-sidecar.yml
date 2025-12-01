@@ -1,0 +1,143 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubernetes-mcp-server
+  namespace: default
+  # Note: No ClusterRole/ClusterRoleBinding needed!
+  # kubernetes-mcp-server uses Bearer tokens from the Authorization header (user's OAuth token)
+  # for all Kubernetes API operations, not the ServiceAccount token.
+  # The ServiceAccount is only needed for the pod to run.
+  # All permissions come from the user's OAuth token that MCP Shield forwards.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: kubernetes-mcp-server
+  namespace: default
+  labels:
+    app: kubernetes-mcp-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubernetes-mcp-server
+  template:
+    metadata:
+      labels:
+        app: kubernetes-mcp-server
+    spec:
+      serviceAccountName: kubernetes-mcp-server
+      containers:
+      # Main kubernetes-mcp-server container
+      - name: kubernetes-mcp-server
+        image: quay.io/containers/kubernetes_mcp_server:latest
+        args:
+          - '--port=8080'
+          - '--log-level=2'
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8080
+          name: http
+        # MCP Shield handles OAuth, so we don't need --require-oauth
+        # The server will extract Bearer tokens from Authorization header
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      # MCP Shield sidecar container
+      - name: mcp-shield
+        image: quay.io/jpinsonn/mcp-shield:dev
+        args:
+          - '--listen=:8081'
+          - '--log-level=info'
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8081
+          name: oauth
+        env:
+          # OAuth Configuration
+          # OAUTH_AUTHORIZATION_SERVERS should point to the public URL where MCP Shield is accessible
+          - name: OAUTH_AUTHORIZATION_SERVERS
+            value: "https://kubernetes-mcp-server.apps.PLACEHOLDER"
+          # INSPECTOR_ORIGIN is the origin of the MCP Inspector (for CORS headers)
+          - name: INSPECTOR_ORIGIN
+            value: "https://mcp-inspector.apps.PLACEHOLDER"
+          # OAUTH_CLIENT_ID must match the OAuthClient name in OpenShift
+          - name: OAUTH_CLIENT_ID
+            value: "kubernetes-mcp-server"
+          # OAUTH_REDIRECT_URIS (optional) - comma-separated list of additional redirect URIs
+          # Default redirect URIs are automatically generated from OAUTH_AUTHORIZATION_SERVERS and INSPECTOR_ORIGIN
+          # - name: OAUTH_REDIRECT_URIS
+          #   value: "https://custom-redirect.example.com/callback"
+          # OpenShift OAuth Token Exchange Configuration
+          # OPENSHIFT_OAUTH_TOKEN_URL will be auto-derived from OAUTH_AUTHORIZATION_SERVERS if not set
+          - name: OPENSHIFT_OAUTH_TOKEN_URL
+            value: ""  # Leave empty to auto-derive from OAUTH_AUTHORIZATION_SERVERS
+          # MCP Backend Configuration
+          # MCP_BACKEND_URL is the URL of the MCP server container (defaults to http://localhost:8080)
+          # In a sidecar setup, this should point to the main container's port
+          - name: MCP_BACKEND_URL
+            value: "http://localhost:8080"  # Points to kubernetes-mcp-server container in the same pod
+          # MCP_BACKEND_PATH is the endpoint path to forward requests to
+          # For Kubernetes MCP server, use /mcp (default)
+          - name: MCP_BACKEND_PATH
+            value: "/mcp"  # Kubernetes MCP server uses /mcp endpoint
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 5
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: kubernetes-mcp-server
+  namespace: default
+  labels:
+    app: kubernetes-mcp-server
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: kubernetes-mcp-server-tls
+spec:
+  selector:
+    app: kubernetes-mcp-server
+  ports:
+    # Expose MCP Shield port (clients connect here)
+    - port: 8081
+      targetPort: 8081
+      protocol: TCP
+      name: oauth
+    # Also expose direct MCP port (optional, for internal use)
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: mcp
+---
+# OAuth Client configuration (create this using oc command or apply separately)
+# Example command to create OAuth client:
+# oc create -f - <<EOF
+# apiVersion: oauth.openshift.io/v1
+# kind: OAuthClient
+# metadata:
+#   name: kubernetes-mcp-server
+# grantMethod: auto
+# redirectURIs:
+#   - "https://kubernetes-mcp-server.default.svc:8081/oauth/callback"
+#   - "https://kubernetes-mcp-server.apps.<YOUR_CLUSTER_DOMAIN>/oauth/callback"
+#   - "http://localhost:*/callback"  # For MCP clients like Claude CLI (if supported)
+# EOF
+

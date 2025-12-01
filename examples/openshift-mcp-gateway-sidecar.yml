@@ -1,0 +1,216 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: mcp-gateway
+  namespace: default
+  # Note: No ClusterRoleBinding needed!
+  # MCP Gateway uses Bearer tokens from the Authorization header (user's OAuth token)
+  # for authentication with backend MCP servers, not the ServiceAccount token.
+  # The ServiceAccount is only needed for the pod to run.
+  # All permissions come from the user's OAuth token that MCP Shield forwards. See MCP Gateway deployment guide for details.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-gateway-config
+  namespace: default
+  labels:
+    app: mcp-gateway
+data:
+  config.yaml: |
+    # MCP Gateway configuration
+    # This is a minimal example - adjust based on your needs
+    # IMPORTANT: You must configure at least one backend MCP server for the gateway to work
+    # 
+    # Example configurations for common MCP servers:
+    #
+    # Prometheus MCP Server:
+    # servers:
+    #   - name: prometheus
+    #     url: http://prometheus-mcp-server.default.svc:8080/mcp
+    #     toolPrefix: prometheus_
+    #     enabled: true
+    #     hostname: prometheus.mcp.local
+    #
+    # Kubernetes MCP Server:
+    # servers:
+    #   - name: kubernetes
+    #     url: http://kubernetes-mcp-server.default.svc:8080/mcp
+    #     toolPrefix: k8s_
+    #     enabled: true
+    #     hostname: kubernetes.mcp.local
+    #
+    # Loki MCP Server:
+    # servers:
+    #   - name: loki
+    #     url: http://loki-mcp.default.svc:8080/stream
+    #     toolPrefix: loki_
+    #     enabled: true
+    #     hostname: loki.mcp.local
+    #
+    # IMPORTANT: Do NOT set credentialEnvVar for backend servers when using MCP Shield
+    # MCP Shield provides the Authorization header dynamically, so static credentials
+    # are not needed and would override the dynamic token from MCP Shield
+    #
+    # For now, this is an empty configuration - add your backend MCP servers above
+    servers: []
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mcp-gateway
+  namespace: default
+  labels:
+    app: mcp-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mcp-gateway
+  template:
+    metadata:
+      labels:
+        app: mcp-gateway
+    spec:
+      serviceAccountName: mcp-gateway
+      containers:
+      # Main mcp-gateway container
+      - name: mcp-broker-router
+        # mcp-gateway needs to allow standalone tool forwarding
+        # See docs/mcp-gateway-changes.md for the required code changes
+        image: quay.io/jpinsonn/mcp-gateway:dev
+        # image: ghcr.io/kagenti/mcp-gateway:latest
+        imagePullPolicy: IfNotPresent
+        command:
+          - ./mcp_gateway
+        args:
+          - '--mcp-gateway-config=/config/config.yaml'
+          - '--mcp-broker-public-address=0.0.0.0:8080'
+          - '--mcp-broker-config-address=0.0.0.0:8181'
+          - '--mcp-gateway-public-host=mcp-gateway.apps.PLACEHOLDER'
+          - '--mcp-router-address=0.0.0.0:50051'
+          - '--log-level=0'
+        ports:
+        - containerPort: 8080
+          name: http
+        - containerPort: 8181
+          name: config
+        - containerPort: 50051
+          name: grpc
+        volumeMounts:
+        - name: config-volume
+          mountPath: /config
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+      # MCP Shield sidecar container
+      - name: mcp-shield
+        image: quay.io/jpinsonn/mcp-shield:dev
+        args:
+          - '--listen=:8081'
+          - '--log-level=info'
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 8081
+          name: oauth
+        env:
+          # OAuth Configuration
+          # OAUTH_AUTHORIZATION_SERVERS should point to the public URL where MCP Shield is accessible
+          - name: OAUTH_AUTHORIZATION_SERVERS
+            value: "https://mcp-gateway.apps.PLACEHOLDER"
+          # INSPECTOR_ORIGIN is the origin of the MCP Inspector (for CORS headers)
+          - name: INSPECTOR_ORIGIN
+            value: "https://mcp-inspector.apps.PLACEHOLDER"
+          # OAUTH_CLIENT_ID must match the OAuthClient name in OpenShift
+          - name: OAUTH_CLIENT_ID
+            value: "mcp-gateway"
+          # OAUTH_REDIRECT_URIS (optional) - comma-separated list of additional redirect URIs
+          # Default redirect URIs are automatically generated from OAUTH_AUTHORIZATION_SERVERS and INSPECTOR_ORIGIN
+          # - name: OAUTH_REDIRECT_URIS
+          #   value: "https://custom-redirect.example.com/callback"
+          # OpenShift OAuth Token Exchange Configuration
+          # OPENSHIFT_OAUTH_TOKEN_URL will be auto-derived from OAUTH_AUTHORIZATION_SERVERS if not set
+          - name: OPENSHIFT_OAUTH_TOKEN_URL
+            value: ""  # Leave empty to auto-derive from OAUTH_AUTHORIZATION_SERVERS
+          # MCP Backend Configuration
+          # MCP_BACKEND_URL is the URL of the MCP Gateway container (defaults to http://localhost:8080)
+          # In a sidecar setup, this should point to the main container's port
+          - name: MCP_BACKEND_URL
+            value: "http://localhost:8080"  # Points to mcp-broker-router container in the same pod
+          # MCP_BACKEND_PATH is the endpoint path to forward requests to
+          # For MCP Gateway, use /mcp (default)
+          - name: MCP_BACKEND_PATH
+            value: "/mcp"  # MCP Gateway uses /mcp endpoint
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /healthz
+            port: 8081
+          initialDelaySeconds: 5
+          periodSeconds: 5
+      volumes:
+        - name: config-volume
+          configMap:
+            name: mcp-gateway-config
+---
+kind: Service
+apiVersion: v1
+metadata:
+  name: mcp-gateway
+  namespace: default
+  labels:
+    app: mcp-gateway
+  annotations:
+    service.beta.openshift.io/serving-cert-secret-name: mcp-gateway-tls
+spec:
+  selector:
+    app: mcp-gateway
+  ports:
+    # Expose MCP Shield port (clients connect here)
+    - port: 8081
+      targetPort: 8081
+      protocol: TCP
+      name: oauth
+    # Also expose direct MCP Gateway port (optional, for internal use)
+    - port: 8080
+      targetPort: 8080
+      protocol: TCP
+      name: mcp
+    # Expose config API port (internal use)
+    - port: 8181
+      targetPort: 8181
+      protocol: TCP
+      name: config
+    # Expose gRPC router port (internal use, for Envoy ext_proc)
+    - port: 50051
+      targetPort: 50051
+      protocol: TCP
+      name: grpc
+---
+# OAuth Client configuration (create this using oc command or apply separately)
+# Example command to create OAuth client:
+# oc create -f - <<EOF
+# apiVersion: oauth.openshift.io/v1
+# kind: OAuthClient
+# metadata:
+#   name: mcp-gateway
+# grantMethod: auto
+# redirectURIs:
+#   - "https://mcp-gateway.default.svc:8081/oauth/callback"
+#   - "https://mcp-gateway.apps.<YOUR_CLUSTER_DOMAIN>/oauth/callback"
+# EOF
+
