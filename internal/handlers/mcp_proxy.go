@@ -18,11 +18,13 @@ import (
 
 // MCPProxyHandler handles proxying requests to the MCP server
 type MCPProxyHandler struct {
-	Logger      *slog.Logger
-	MCPBackend  string                 // Backend MCP server URL (e.g., "http://localhost:8080")
-	BackendPath string                 // Backend path to forward to (e.g., "/mcp" or "/stream")
-	TokenStore  *tokenstore.TokenStore // Token store for proxy token exchange
-	httpClient  *http.Client
+	Logger            *slog.Logger
+	MCPBackend        string                 // Backend MCP server URL (e.g., "http://localhost:8080") - fallback if no routing
+	BackendPath       string                 // Backend path to forward to (e.g., "/mcp" or "/stream")
+	TokenStore        *tokenstore.TokenStore // Token store for proxy token exchange
+	ToolRouter        *ToolRouter            // Tool router for direct upstream routing
+	GatewayDiscoverer *GatewayDiscoverer     // Gateway discoverer for gateway detection
+	httpClient        *http.Client
 }
 
 // NewMCPProxyHandler creates a new MCPProxyHandler
@@ -68,28 +70,9 @@ func (mph *MCPProxyHandler) Handle(w http.ResponseWriter, r *http.Request) {
 	}
 	mph.Logger.Info("Proxying MCP request", "method", r.Method, "path", r.URL.Path, "query", r.URL.RawQuery, "auth_type", authType, "has_auth", hasAuth)
 
-	// Build backend URL
-	backendURL, err := url.Parse(mph.MCPBackend)
-	if err != nil {
-		mph.Logger.Error("Invalid MCP backend URL", "error", err, "backend", mph.MCPBackend)
-		http.Error(w, "Internal server error: invalid backend configuration", http.StatusInternalServerError)
-		return
-	}
-
-	// Preserve the original path (e.g., /mcp)
-	// If the request is to root (/), forward to the configured backend path
-	// For Prometheus MCP server: use /mcp
-	// For Loki MCP server: use /stream
-	if r.URL.Path == "/" || r.URL.Path == "/mcp" || r.URL.Path == "/mcp/" {
-		backendURL.Path = mph.BackendPath
-		mph.Logger.Debug("Forwarding to configured backend path", "original_path", r.URL.Path, "backend_path", mph.BackendPath)
-	} else {
-		backendURL.Path = r.URL.Path
-	}
-	backendURL.RawQuery = r.URL.RawQuery
-
 	// Read request body to potentially modify JSON-RPC requests
 	var requestBody []byte
+	var err error
 	if r.Body != nil {
 		requestBody, err = io.ReadAll(r.Body)
 		if err != nil {
@@ -100,17 +83,74 @@ func (mph *MCPProxyHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		r.Body.Close()
 	}
 
-	// Try to parse as JSON-RPC and inject sessionId if missing (for Loki MCP server)
+	// Try to parse as JSON-RPC to check for tool calls and route directly
 	var modifiedBody []byte = requestBody
+	var toolName string
+	var upstreamURL string
+	var sessionEstablished bool        // Flag to track if we've already established a session for direct routing
+	var upstreamSessionID string       // Store upstream session ID to set in HTTP header
+	var jsonRPC map[string]interface{} // JSON-RPC request object (parsed once, may be re-parsed on fallback)
+
 	if len(requestBody) > 0 {
 		contentType := r.Header.Get("Content-Type")
 		// Only try to parse JSON if Content-Type suggests it's JSON
 		if strings.Contains(strings.ToLower(contentType), "application/json") || contentType == "" {
-			var jsonRPC map[string]interface{}
+			// Parse JSON-RPC request (will be re-parsed if routing fails)
 			if err := json.Unmarshal(requestBody, &jsonRPC); err == nil {
 				// Check if it's a JSON-RPC request (has jsonrpc field)
 				if _, isJSONRPC := jsonRPC["jsonrpc"]; isJSONRPC {
+					// Check if this is a tool call
+					if method, ok := jsonRPC["method"].(string); ok && method == "tools/call" {
+						// Extract tool name from params
+						if params, ok := jsonRPC["params"].(map[string]interface{}); ok {
+							if name, ok := params["name"].(string); ok {
+								toolName = name
+								mph.Logger.Info("Detected tool call", "tool_name", toolName)
+
+								// Try to route directly to upstream server
+								routingResult, err := tryDirectRouting(
+									mph.Logger,
+									mph.ToolRouter,
+									toolName,
+									jsonRPC,
+									requestBody,
+									authHeader,
+									mph.TokenStore,
+									r.Context(),
+								)
+
+								if err != nil {
+									mph.Logger.Warn("Error during direct routing attempt", "error", err)
+									// Fall through to fallback
+								}
+
+								if routingResult != nil && routingResult.Success {
+									upstreamURL = routingResult.UpstreamURL
+									upstreamSessionID = routingResult.UpstreamSessionID
+									modifiedBody = routingResult.ModifiedBody
+									sessionEstablished = true
+								} else {
+									// Direct routing failed or not available - use fallback
+									mph.Logger.Debug("Using fallback backend for tool call", "tool_name", toolName)
+									upstreamURL = ""
+									upstreamSessionID = ""
+									sessionEstablished = false
+									modifiedBody = requestBody
+									// Re-parse JSON to get a clean copy for session ID injection
+									if parseErr := json.Unmarshal(requestBody, &jsonRPC); parseErr != nil {
+										mph.Logger.Warn("Failed to re-parse JSON after routing failure", "error", parseErr)
+										modifiedBody = requestBody
+									} else {
+										mph.Logger.Debug("Re-parsed JSON after routing failure to ensure clean state")
+									}
+								}
+							}
+						}
+					}
 					// Check if sessionId is missing (check both root level and params level)
+					// Note: When routing directly to upstream servers, we don't inject session IDs
+					// as they may require proper session establishment via initialize first.
+					// Only inject for gateway/fallback routing (e.g., Loki MCP server).
 					hasSessionID := false
 					var sessionID string
 
@@ -130,7 +170,10 @@ func (mph *MCPProxyHandler) Handle(w http.ResponseWriter, r *http.Request) {
 						}
 					}
 
-					if !hasSessionID {
+					// Only inject session ID if we're NOT routing directly to upstream servers
+					// Direct routing should use the client's session ID or let the server handle it
+					if !hasSessionID && upstreamURL == "" {
+						// Only inject for gateway/fallback routing (e.g., Loki MCP server needs it)
 						// Generate a sessionId - try to get from cookie first, otherwise generate a new one
 						if sessionCookie, err := r.Cookie("mcp-session-id"); err == nil && sessionCookie.Value != "" {
 							sessionID = sessionCookie.Value
@@ -196,6 +239,33 @@ func (mph *MCPProxyHandler) Handle(w http.ResponseWriter, r *http.Request) {
 								mph.Logger.Warn("Failed to verify injected sessionId", "error", err)
 							}
 						}
+					} else if upstreamURL != "" && !sessionEstablished {
+						// Routing directly to upstream - remove any existing session ID
+						// The client's session ID is for the gateway, not the upstream server
+						// Only do this if we haven't already established a session above
+						if hasSessionID {
+							// Remove session ID from both root and params
+							if _, exists := jsonRPC["sessionId"]; exists {
+								delete(jsonRPC, "sessionId")
+								mph.Logger.Debug("Removed gateway sessionId from root level for direct upstream routing")
+							}
+							if params, ok := jsonRPC["params"].(map[string]interface{}); ok {
+								if _, exists := params["sessionId"]; exists {
+									delete(params, "sessionId")
+									mph.Logger.Debug("Removed gateway sessionId from params for direct upstream routing")
+								}
+							}
+							// Re-marshal without session ID
+							modifiedBody, err = json.Marshal(jsonRPC)
+							if err != nil {
+								mph.Logger.Warn("Failed to remove sessionId from request", "error", err)
+								modifiedBody = requestBody
+							} else {
+								mph.Logger.Info("Removed gateway sessionId for direct upstream routing", "original_sessionId", sessionID)
+							}
+						} else {
+							mph.Logger.Debug("Routing directly to upstream server, no sessionId to remove")
+						}
 					} else {
 						mph.Logger.Debug("JSON-RPC request already has sessionId")
 					}
@@ -216,8 +286,46 @@ func (mph *MCPProxyHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		mph.Logger.Debug("Request body is empty, skipping sessionId injection")
 	}
 
+	// Determine backend URL - use upstream server if tool was routed, otherwise use fallback
+	var backendURL *url.URL
+	if upstreamURL != "" {
+		// Route directly to upstream server
+		backendURL, err = url.Parse(upstreamURL)
+		if err != nil {
+			mph.Logger.Error("Invalid upstream server URL", "error", err, "url", upstreamURL)
+			http.Error(w, "Internal server error: invalid upstream server configuration", http.StatusInternalServerError)
+			return
+		}
+		mph.Logger.Debug("Using upstream server URL", "url", upstreamURL)
+		// Preserve query string from original request
+		backendURL.RawQuery = r.URL.RawQuery
+	} else {
+		// Fallback to configured backend (e.g., mcp-gateway or direct MCP server)
+		backendURL, err = url.Parse(mph.MCPBackend)
+		if err != nil {
+			mph.Logger.Error("Invalid MCP backend URL", "error", err, "backend", mph.MCPBackend)
+			http.Error(w, "Internal server error: invalid backend configuration", http.StatusInternalServerError)
+			return
+		}
+
+		// Preserve the original path (e.g., /mcp)
+		// If the request is to root (/), forward to the configured backend path
+		// For Prometheus MCP server: use /mcp
+		// For Loki MCP server: use /stream
+		if r.URL.Path == "/" || r.URL.Path == "/mcp" || r.URL.Path == "/mcp/" {
+			backendURL.Path = mph.BackendPath
+			mph.Logger.Debug("Forwarding to configured backend path", "original_path", r.URL.Path, "backend_path", mph.BackendPath, "backend_url", backendURL.String())
+		} else {
+			backendURL.Path = r.URL.Path
+			mph.Logger.Debug("Forwarding with original path", "original_path", r.URL.Path, "backend_url", backendURL.String())
+		}
+		backendURL.RawQuery = r.URL.RawQuery
+	}
+
 	// Create a new request to the backend with modified body
-	req, err := http.NewRequest(r.Method, backendURL.String(), bytes.NewReader(modifiedBody))
+	finalURL := backendURL.String()
+	mph.Logger.Debug("Creating backend request", "method", r.Method, "url", finalURL, "body_length", len(modifiedBody), "upstream_routed", upstreamURL != "")
+	req, err := http.NewRequest(r.Method, finalURL, bytes.NewReader(modifiedBody))
 	if err != nil {
 		mph.Logger.Error("Failed to create backend request", "error", err)
 		http.Error(w, "Internal server error", http.StatusInternalServerError)
@@ -262,6 +370,14 @@ func (mph *MCPProxyHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Set headers for direct routing to upstream servers
+	if upstreamURL != "" && upstreamSessionID != "" {
+		req.Header.Set("mcp-session-id", upstreamSessionID)
+		// Some MCP servers (like kubernetes-mcp-server) require Accept header with both JSON and SSE
+		req.Header.Set("Accept", "application/json, text/event-stream")
+		mph.Logger.Debug("Set headers for upstream request", "session_id", upstreamSessionID)
+	}
+
 	// Copy other headers from the original request
 	// Skip headers that should be set by the HTTP client
 	skipHeaders := map[string]struct{}{
@@ -274,6 +390,12 @@ func (mph *MCPProxyHandler) Handle(w http.ResponseWriter, r *http.Request) {
 		"proxy-authenticate":  {},
 		"proxy-authorization": {},
 		"authorization":       {}, // Already handled above
+	}
+
+	// Only skip mcp-session-id if we're routing directly to upstream (we set it above)
+	// Otherwise, forward it from the client for gateway/fallback routing
+	if upstreamURL != "" {
+		skipHeaders["mcp-session-id"] = struct{}{} // Skip client's header, use our upstream session ID
 	}
 
 	for k, v := range r.Header {

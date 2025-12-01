@@ -10,7 +10,7 @@ Supported MCP servers:
 - [prometheus-mcp-server](https://github.com/tjhop/prometheus-mcp-server)
 - [loki-mcp](https://github.com/grafana/loki-mcp)
 - [kubernetes-mcp-server](https://github.com/containers/kubernetes-mcp-server)
-- [mcp-gateway](https://github.com/kagenti/mcp-gateway) - *Note: Requires code changes to enable standalone tool forwarding. See [mcp-gateway-changes.md](docs/mcp-gateway-changes.md) for details.*
+- [mcp-gateway](https://github.com/kagenti/mcp-gateway)
 
 > **Note**: MCP Shield has been tested with Claude (Anthropic's AI assistant) as an MCP client. The implementation is designed to work with any MCP client that follows the OAuth 2.0 flow with Bearer token authentication.
 
@@ -51,8 +51,11 @@ Supported MCP servers:
 
 - **`MCP_BACKEND_URL`** (optional): URL of the MCP server backend container
   - Defaults to `http://localhost:8080` if not set
-  - Used by the MCP proxy to forward requests
-  - Example: `http://localhost:8080` (for sidecar in same pod)
+  - **Automatic Gateway Detection**: MCP Shield automatically detects if this points to an mcp-gateway instance by calling its `/status` endpoint
+  - **If detected as a gateway**: MCP Shield automatically discovers upstream servers and routes tool calls directly to them. Session management is handled automatically via `initialize` calls with session IDs in both JSON body and HTTP header (`mcp-session-id`)
+  - **If NOT detected as a gateway**: MCP Shield uses it as a regular fallback for all MCP requests (including tool calls). No direct routing is attempted, and requests are forwarded to the backend as-is
+  - Example: `http://localhost:8080` (for sidecar in same pod) or `http://mcp-gateway:8080` (for gateway discovery)
+  - See [Direct Tool Routing](./docs/direct-tool-routing.md) for details
 
 - **`MCP_BACKEND_PATH`** (optional): Backend path endpoint to forward requests to
   - Defaults to `/mcp` if not set (for Prometheus MCP server)
@@ -172,7 +175,7 @@ MCP Shield is designed to run as a sidecar container alongside your MCP server. 
 - **[Prometheus MCP Server](docs/examples/prometheus-mcp-server.md)** - Complete guide for deploying with prometheus-mcp-server
 - **[Loki MCP Server](docs/examples/loki-mcp-server.md)** - Complete guide for deploying with loki-mcp-server
 - **[Kubernetes MCP Server](docs/examples/kubernetes-mcp-server.md)** - Complete guide for deploying with kubernetes-mcp-server
-- **[MCP Gateway](docs/examples/mcp-gateway.md)** - Complete guide for deploying with mcp-gateway (requires code changes - see [mcp-gateway-changes.md](docs/mcp-gateway-changes.md))
+- **[MCP Gateway](docs/examples/mcp-gateway.md)** - Complete guide for deploying with mcp-gateway
 
 ### MCP Server Endpoint Differences
 

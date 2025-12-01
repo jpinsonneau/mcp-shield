@@ -137,6 +137,7 @@ You might also wonder why we don't use [mcp-gateway](https://github.com/kagenti/
 - You're deploying to OpenShift and need OpenShift-specific OAuth handling
 - You want proxy tokens for enhanced security
 - You need support for dynamic localhost redirect URIs (agentic CLI clients)
+- You're using mcp-gateway and want direct tool routing for better performance
 
 **Use MCP Shield WITH mcp-gateway when:**
 - You need mcp-gateway's multi-server aggregation capabilities
@@ -145,15 +146,21 @@ You might also wonder why we don't use [mcp-gateway](https://github.com/kagenti/
 - You're deploying to OpenShift and need OpenShift-specific OAuth handling
 - You want proxy tokens for enhanced security
 - You need support for dynamic localhost redirect URIs (agentic CLI clients)
+- You want **direct tool routing** for better performance (tool calls bypass mcp-gateway)
 
 When using MCP Shield with mcp-gateway:
 - MCP Shield runs as a sidecar alongside mcp-gateway, handling OAuth flows
+- **Automatic Gateway Discovery**: MCP Shield automatically detects mcp-gateway and discovers upstream servers from its `/status` endpoint
+- **Direct Tool Routing**: MCP Shield routes tool calls directly to upstream MCP servers, bypassing mcp-gateway for better performance
+  - Tool calls go: Client → MCP Shield → Upstream MCP Server (direct)
+  - Non-tool requests (like `tools/list`) go: Client → MCP Shield → mcp-gateway (for aggregation)
+- **Session Management**: MCP Shield automatically establishes and manages sessions with upstream servers for direct routing
 - MCP Shield forwards requests to mcp-gateway with the Authorization header containing the real OAuth token
 - mcp-gateway uses the Authorization header from MCP Shield when connecting to backend MCP servers
-- This provides the best of both worlds: multi-server aggregation (mcp-gateway) + complete OAuth flow handling (MCP Shield)
+- This provides the best of both worlds: multi-server aggregation (mcp-gateway) + complete OAuth flow handling (MCP Shield) + direct tool routing for performance
 - **Important**: Do not configure static credentials for backend servers in mcp-gateway when using MCP Shield, as the dynamic Authorization header from MCP Shield should be used instead
 
-See the [MCP Gateway deployment guide](examples/mcp-gateway.md) for details on deploying MCP Shield with mcp-gateway.
+See the [MCP Gateway deployment guide](examples/mcp-gateway.md) and [Direct Tool Routing documentation](direct-tool-routing.md) for details on deploying MCP Shield with mcp-gateway.
 
 ### Summary
 
@@ -161,7 +168,14 @@ mcp-gateway is a powerful solution for multi-server MCP deployments, while MCP S
 
 - **MCP Shield alone**: Best for single MCP server deployments that need complete OAuth flow handling
 - **mcp-gateway alone**: Best for multi-server deployments with existing OAuth infrastructure
-- **MCP Shield + mcp-gateway**: Best for multi-server deployments that need complete OAuth flow handling with OpenShift-specific features and proxy token security
+- **MCP Shield + mcp-gateway**: Best for multi-server deployments that need complete OAuth flow handling with OpenShift-specific features, proxy token security, and direct tool routing for better performance
 
-If you're running a single MCP server (like prometheus-mcp-server) and need full OAuth support for MCP clients, MCP Shield provides a simpler, more focused solution. If you need to aggregate multiple MCP servers and also need complete OAuth flow handling, use MCP Shield as a sidecar with mcp-gateway.
+**Key Features When Using MCP Shield with mcp-gateway:**
+- ✅ **Automatic Gateway Discovery**: MCP Shield automatically detects mcp-gateway and discovers upstream servers
+- ✅ **Direct Tool Routing**: Tool calls bypass mcp-gateway and go directly to upstream servers, reducing latency
+- ✅ **Complete OAuth Flow**: Full OAuth 2.0 discovery, registration, and token exchange support
+- ✅ **Proxy Token Security**: Enhanced security with proxy tokens instead of exposing real user tokens
+- ✅ **Session Management**: Automatic session establishment and management for direct routing
+
+If you're running a single MCP server (like prometheus-mcp-server) and need full OAuth support for MCP clients, MCP Shield provides a simpler, more focused solution. If you need to aggregate multiple MCP servers and also need complete OAuth flow handling, use MCP Shield as a sidecar with mcp-gateway to get the benefits of both: multi-server aggregation, complete OAuth flow handling, and direct tool routing for optimal performance.
 

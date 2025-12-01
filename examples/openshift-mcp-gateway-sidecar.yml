@@ -76,10 +76,7 @@ spec:
       containers:
       # Main mcp-gateway container
       - name: mcp-broker-router
-        # mcp-gateway needs to allow standalone tool forwarding
-        # See docs/mcp-gateway-changes.md for the required code changes
-        image: quay.io/jpinsonn/mcp-gateway:dev
-        # image: ghcr.io/kagenti/mcp-gateway:latest
+        image: ghcr.io/kagenti/mcp-gateway:latest
         imagePullPolicy: IfNotPresent
         command:
           - ./mcp_gateway

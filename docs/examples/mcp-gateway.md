@@ -5,11 +5,6 @@ MCP Shield can be deployed alongside the [MCP Gateway](https://github.com/kagent
 An example deployment is provided in `examples/openshift-mcp-gateway-sidecar.yml`.
 
 
-## Prerequisites
-
-**Important**: MCP Gateway requires code changes to enable standalone tool forwarding when used without Envoy/router. These changes are necessary for MCP Gateway to work with MCP Shield as a sidecar.
-
-See [mcp-gateway-changes.md](../mcp-gateway-changes.md) for the complete git diff and detailed explanation of the required changes.
 
 ## Quick Start (Automated)
 

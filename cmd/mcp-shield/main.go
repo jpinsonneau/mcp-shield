@@ -41,7 +41,26 @@ func main() {
 	oauthDiscoveryHandler := handlers.NewOAuthDiscoveryHandler(logger)
 	oauthTokenHandler := handlers.NewOAuthTokenHandler(logger)
 	oauthCallbackHandler := handlers.NewOAuthCallbackHandler(logger)
+
+	// Get backend URL for gateway discovery
+	backendURL := os.Getenv("MCP_BACKEND_URL")
+	if backendURL == "" {
+		backendURL = "http://localhost:8080"
+		logger.Info("MCP_BACKEND_URL not set, using default", "backend", backendURL)
+	}
+
+	// Create ToolRouter for upstream server routing
+	toolRouter := handlers.NewToolRouter(logger)
+
+	// Create GatewayDiscoverer to handle gateway detection and discovery
+	// It will automatically update ToolRouter when servers are discovered
+	gatewayDiscoverer := handlers.NewGatewayDiscoverer(logger, backendURL, func(servers map[string]*handlers.UpstreamServer) {
+		toolRouter.UpdateUpstreamServers(servers)
+	})
+
 	mcpProxyHandler := handlers.NewMCPProxyHandler(logger, oauthTokenHandler.GetTokenStore())
+	mcpProxyHandler.ToolRouter = toolRouter
+	mcpProxyHandler.GatewayDiscoverer = gatewayDiscoverer
 
 	// Register OAuth endpoints
 	mux.HandleFunc("/.well-known/oauth-authorization-server", oauthDiscoveryHandler.HandleAuthorizationServer)
