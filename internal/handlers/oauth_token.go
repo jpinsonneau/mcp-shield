@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -17,6 +18,12 @@ import (
 
 	"github.com/jpinsonn/mcp-shield/internal/tokenstore"
 )
+
+// openshiftAppsHostRE matches OAUTH_AUTHORIZATION_SERVERS primary URL (https://<name>.apps.<domain>).
+var openshiftAppsHostRE = regexp.MustCompile(`https://[^.]+\.apps\.(.+)`)
+
+// openShiftOAuthTokenURLInCluster is the OAuth token endpoint reachable from pods without using the public apps route.
+const openShiftOAuthTokenURLInCluster = "https://oauth-openshift.openshift-authentication.svc.cluster.local/oauth/token"
 
 // OAuthTokenHandler handles the /oauth/token endpoint for OpenShift OAuth token exchange
 type OAuthTokenHandler struct {
@@ -33,18 +40,20 @@ type OAuthTokenHandler struct {
 func NewOAuthTokenHandler(logger *slog.Logger) *OAuthTokenHandler {
 	oauthTokenURL := os.Getenv(envOpenShiftOAuthTokenURL)
 	if oauthTokenURL == "" {
-		// Attempt to derive from OAUTH_AUTHORIZATION_SERVERS if OPENSHIFT_OAUTH_TOKEN_URL is not set
 		authServers := os.Getenv(envOAuthAuthorizationServers)
 		if authServers != "" {
-			// Assuming the first server in the comma-separated list is the primary one
 			firstAuthServer := strings.TrimSpace(strings.Split(authServers, ",")[0])
-			// Extract cluster domain from OAUTH_AUTHORIZATION_SERVERS
-			// URL format: https://<service-name>.apps.<cluster-domain>
-			match := regexp.MustCompile(`https://[^.]*\.apps\.(.+)`).FindStringSubmatch(firstAuthServer)
-			if len(match) > 1 {
-				clusterDomain := match[1]
-				oauthTokenURL = fmt.Sprintf("https://oauth-openshift.apps.%s/oauth/token", clusterDomain)
-				logger.Info("Derived OpenShift OAuth Token URL", "url", oauthTokenURL)
+			if openshiftAppsHostRE.MatchString(firstAuthServer) {
+				// From inside the cluster, calling oauth-openshift.apps.* can hang (hairpin / edge routing) and surface as 504 on /oauth/token.
+				if os.Getenv("KUBERNETES_SERVICE_HOST") != "" {
+					oauthTokenURL = openShiftOAuthTokenURLInCluster
+					logger.Info("Derived OpenShift OAuth Token URL (in-cluster)", "url", oauthTokenURL)
+				} else {
+					match := openshiftAppsHostRE.FindStringSubmatch(firstAuthServer)
+					clusterDomain := match[1]
+					oauthTokenURL = fmt.Sprintf("https://oauth-openshift.apps.%s/oauth/token", clusterDomain)
+					logger.Info("Derived OpenShift OAuth Token URL", "url", oauthTokenURL)
+				}
 			} else {
 				logger.Warn("Could not derive OpenShift OAuth Token URL from OAUTH_AUTHORIZATION_SERVERS. Please set OPENSHIFT_OAUTH_TOKEN_URL explicitly.")
 			}
@@ -75,8 +84,9 @@ func NewOAuthTokenHandler(logger *slog.Logger) *OAuthTokenHandler {
 		logger.Warn("OAUTH_CLIENT_ID not set, using default", "client_id", clientID)
 	}
 
-	// Configure a custom HTTP client to skip SSL verification for OpenShift's self-signed certs
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
 	tr := &http.Transport{
+		DialContext: dialer.DialContext,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
 		},
@@ -361,11 +371,10 @@ func (oth *OAuthTokenHandler) fixRedirectURI(body []byte) []byte {
 		return body // Return original body if parsing fails
 	}
 
-	// Check if redirect_uri is a localhost URL
 	if redirectURI, ok := params["redirect_uri"]; ok && len(redirectURI) > 0 {
 		uri := redirectURI[0]
-		if strings.HasPrefix(uri, "http://localhost:") {
-			oth.Logger.Info("Replacing localhost redirect_uri with fixed callback URL",
+		if isLoopbackRedirectURI(uri) {
+			oth.Logger.Info("Replacing loopback redirect_uri with fixed callback URL",
 				"original", uri,
 				"fixed", oth.FixedCallbackURL)
 			params.Set("redirect_uri", oth.FixedCallbackURL)

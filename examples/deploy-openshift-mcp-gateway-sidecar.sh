@@ -95,18 +95,38 @@ replace_placeholders() {
 # Create OAuth Client
 create_oauth_client() {
     print_step "Creating OAuth Client..."
+
+    # Must match OAUTH_AUTHORIZATION_SERVERS / Route host used by MCP Shield (see openshift-mcp-gateway-sidecar.yml).
+    local need_svc need_route
+    need_svc="https://${SERVICE_NAME}.${NAMESPACE}.svc:8081/oauth/callback"
+    need_route="https://${SERVICE_NAME}.apps.${CLUSTER_DOMAIN}/oauth/callback"
     
     # Check if OAuthClient already exists
-    if oc get oauthclient "$OAUTH_CLIENT_ID" >/dev/null 2>&1; then
+    if oc get oauthclient "$OAUTH_CLIENT_ID" &>/dev/null; then
         print_warning "OAuthClient '$OAUTH_CLIENT_ID' already exists. Skipping creation."
-        print_status "If you need to update it, delete it first: oc delete oauthclient $OAUTH_CLIENT_ID"
+        local uris
+        uris=$(oc get oauthclient "$OAUTH_CLIENT_ID" -o jsonpath='{.redirectURIs[*]}' 2>/dev/null || true)
+        local missing=0
+        if ! printf '%s' "$uris" | grep -qF "$need_route"; then
+            print_warning "Existing OAuthClient is missing redirect URI (required for browser OAuth): $need_route"
+            missing=1
+        fi
+        if ! printf '%s' "$uris" | grep -qF "$need_svc"; then
+            print_warning "Existing OAuthClient is missing redirect URI (in-cluster token flow): $need_svc"
+            missing=1
+        fi
+        if [ "$missing" -eq 1 ]; then
+            print_status "Fix: oc delete oauthclient $OAUTH_CLIENT_ID && re-run this deploy, or oc edit oauthclient $OAUTH_CLIENT_ID and add the URIs above."
+        else
+            print_status "Existing redirect URIs look compatible with this deploy (service name, namespace, cluster domain)."
+        fi
         return
     fi
     
     # Build redirect URIs
     REDIRECT_URIS=(
-        "https://${SERVICE_NAME}.${NAMESPACE}.svc:8081/oauth/callback"
-        "https://${SERVICE_NAME}.apps.${CLUSTER_DOMAIN}/oauth/callback"
+        "$need_svc"
+        "$need_route"
     )
     
     # Create OAuthClient
@@ -149,9 +169,9 @@ create_route() {
     
     print_step "Creating Route..."
     
-    # Check if route already exists
+    # Check if route already exists (manifest may already have applied a Route)
     if oc get route "$SERVICE_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
-        print_warning "Route '$SERVICE_NAME' already exists. Skipping creation."
+        print_warning "Route '$SERVICE_NAME' already exists (from manifest or prior run). Skipping oc create route."
         return
     fi
     
@@ -228,8 +248,9 @@ cleanup_deployment() {
     # Delete route
     oc delete route "$SERVICE_NAME" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
     
-    # Delete configmap
+    # Delete configmaps
     oc delete configmap "${SERVICE_NAME}-config" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+    oc delete configmap "${SERVICE_NAME}-kuadrant-authpolicy-example" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
     
     # Delete service account
     oc delete serviceaccount "$SERVICE_NAME" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true

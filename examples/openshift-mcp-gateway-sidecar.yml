@@ -1,3 +1,16 @@
+# MCP Gateway + MCP Shield (through-gateway mode)
+#
+# Replace PLACEHOLDER with your cluster apps domain (e.g. cluster.example.com so hostnames become *.apps.cluster.example.com).
+#
+# Traffic: clients -> OpenShift Route (port 8081, MCP Shield) -> OAuth + proxy token exchange -> localhost:8080 (broker).
+# MCP_SHIELD_DIRECT_TOOL_ROUTING=false: all JSON-RPC (including tools/call) goes through mcp-gateway; Shield still forwards
+# the real OpenShift access token in Authorization after proxy-token exchange.
+#
+# Kuadrant AuthPolicy: do NOT put JWT validation in front of Shield while clients use Shield proxy tokens (opaque), or /mcp
+# will get 401. The optional AuthPolicy document at the bottom is for Istio Gateway API ingress to the MCP listener when
+# clients send a raw OpenShift access token, or when you split listeners; apply it only if you use that topology (see comments there).
+#
+---
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -83,29 +96,43 @@ spec:
         args:
           - '--mcp-gateway-config=/config/config.yaml'
           - '--mcp-broker-public-address=0.0.0.0:8080'
-          - '--mcp-broker-config-address=0.0.0.0:8181'
           - '--mcp-gateway-public-host=mcp-gateway.apps.PLACEHOLDER'
+          # Same pod: router must reach broker HTTP without Istio DNS (default private host points at gateway-system).
+          - '--mcp-gateway-private-host=127.0.0.1:8080'
           - '--mcp-router-address=0.0.0.0:50051'
           - '--log-level=0'
+        env:
+          # Required by mcp-gateway (see upstream cmd/mcp-broker-router). Replace with a Secret in production.
+          - name: JWT_SESSION_SIGNING_KEY
+            value: "e2e-dev-only-replace-with-kubernetes-secret-at-least-32-bytes"
+          # Broker OAuth metadata (MCP protected resource) — point MCP clients at the same public host as MCP Shield (Route below).
+          - name: OAUTH_RESOURCE_NAME
+            value: "MCP Server"
+          - name: OAUTH_RESOURCE
+            value: "https://mcp-gateway.apps.PLACEHOLDER/mcp"
+          - name: OAUTH_AUTHORIZATION_SERVERS
+            value: "https://mcp-gateway.apps.PLACEHOLDER"
+          - name: OAUTH_BEARER_METHODS_SUPPORTED
+            value: "header"
+          - name: OAUTH_SCOPES_SUPPORTED
+            value: "openid"
         ports:
         - containerPort: 8080
           name: http
-        - containerPort: 8181
-          name: config
         - containerPort: 50051
           name: grpc
         volumeMounts:
         - name: config-volume
           mountPath: /config
+        # Prefer TCP: some gateway images may not expose the same HTTP paths on :8080.
+        # NotReady on this container removes the pod from Service endpoints → Route "Application is not available".
         livenessProbe:
-          httpGet:
-            path: /healthz
+          tcpSocket:
             port: 8080
           initialDelaySeconds: 10
           periodSeconds: 30
         readinessProbe:
-          httpGet:
-            path: /readyz
+          tcpSocket:
             port: 8080
           initialDelaySeconds: 5
           periodSeconds: 10
@@ -134,10 +161,10 @@ spec:
           # Default redirect URIs are automatically generated from OAUTH_AUTHORIZATION_SERVERS and INSPECTOR_ORIGIN
           # - name: OAUTH_REDIRECT_URIS
           #   value: "https://custom-redirect.example.com/callback"
-          # OpenShift OAuth Token Exchange Configuration
-          # OPENSHIFT_OAUTH_TOKEN_URL will be auto-derived from OAUTH_AUTHORIZATION_SERVERS if not set
+          # Token exchange from the pod: use in-cluster OAuth. The public oauth-openshift.apps.* URL
+          # often hangs or times out from pods (504 on /oauth/token). Authorize stays on apps (browser).
           - name: OPENSHIFT_OAUTH_TOKEN_URL
-            value: ""  # Leave empty to auto-derive from OAUTH_AUTHORIZATION_SERVERS
+            value: "https://oauth-openshift.openshift-authentication.svc.cluster.local/oauth/token"
           # MCP Backend Configuration
           # MCP_BACKEND_URL is the URL of the MCP Gateway container (defaults to http://localhost:8080)
           # In a sidecar setup, this should point to the main container's port
@@ -147,6 +174,9 @@ spec:
           # For MCP Gateway, use /mcp (default)
           - name: MCP_BACKEND_PATH
             value: "/mcp"  # MCP Gateway uses /mcp endpoint
+          # All MCP JSON-RPC through mcp-gateway (required if you rely on Envoy/Kuadrant in front of the broker only).
+          - name: MCP_SHIELD_DIRECT_TOOL_ROUTING
+            value: "false"
         livenessProbe:
           httpGet:
             path: /healthz
@@ -187,16 +217,32 @@ spec:
       targetPort: 8080
       protocol: TCP
       name: mcp
-    # Expose config API port (internal use)
-    - port: 8181
-      targetPort: 8181
-      protocol: TCP
-      name: config
     # Expose gRPC router port (internal use, for Envoy ext_proc)
     - port: 50051
       targetPort: 50051
       protocol: TCP
       name: grpc
+---
+# Public ingress: terminate TLS at the router and send MCP + OAuth traffic to MCP Shield (:8081), not directly to the broker.
+apiVersion: route.openshift.io/v1
+kind: Route
+metadata:
+  name: mcp-gateway
+  namespace: default
+  labels:
+    app: mcp-gateway
+spec:
+  host: mcp-gateway.apps.PLACEHOLDER
+  to:
+    kind: Service
+    name: mcp-gateway
+    weight: 100
+  port:
+    targetPort: oauth
+  tls:
+    termination: edge
+    insecureEdgeTerminationPolicy: Redirect
+  wildcardPolicy: None
 ---
 # OAuth Client configuration (create this using oc command or apply separately)
 # Example command to create OAuth client:
@@ -210,4 +256,56 @@ spec:
 #   - "https://mcp-gateway.default.svc:8081/oauth/callback"
 #   - "https://mcp-gateway.apps.<YOUR_CLUSTER_DOMAIN>/oauth/callback"
 # EOF
+---
+# Optional: example Kuadrant AuthPolicy for OpenShift access tokens (JWT) at the Istio Gateway.
+# Apply the ConfigMap with: kubectl apply -f openshift-mcp-gateway-sidecar.yml
+# Extract and edit: kubectl get cm mcp-gateway-kuadrant-authpolicy-example -n default -o jsonpath='{.data.authpolicy\.yaml}' > /tmp/authpolicy.yaml
+# Then: kubectl apply -f /tmp/authpolicy.yaml   (after fixing namespace, Gateway name, sectionName, issuerUrl)
+#
+# Do NOT use this JWT policy on the same listener where MCP Shield clients send proxy tokens (opaque Bearer) — validation will fail.
+# Use this only when the Gateway fronts the broker and clients send raw OpenShift OAuth access tokens, or after you redesign auth.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: mcp-gateway-kuadrant-authpolicy-example
+  namespace: default
+  labels:
+    app: mcp-gateway
+data:
+  README: |
+    authpolicy.yaml is an example Kuadrant AuthPolicy (not applied automatically).
+    Prerequisites: Kuadrant, Gateway API Gateway named like targetRef below, listener sectionName matching your MCP listener.
+    issuerUrl must match your cluster OpenShift OAuth (curl -s https://oauth-openshift.apps.<cluster>/.well-known/oauth-authorization-server | jq .issuer).
+    Excludes /.well-known and /oauth* so OAuth discovery and Shield endpoints can stay unauthenticated at the mesh if traffic ever hits the same host.
+  authpolicy.yaml: |
+    apiVersion: kuadrant.io/v1
+    kind: AuthPolicy
+    metadata:
+      name: mcp-openshift-user-jwt
+      namespace: gateway-system
+    spec:
+      targetRef:
+        group: gateway.networking.k8s.io
+        kind: Gateway
+        name: mcp-gateway
+        sectionName: mcp
+      defaults:
+        when:
+          - predicate: "!request.path.contains('/.well-known')"
+          - predicate: "!request.path.contains('/oauth')"
+          - predicate: "!request.path.contains('/oauth2')"
+      rules:
+        authentication:
+          openshift-user:
+            jwt:
+              issuerUrl: https://oauth-openshift.apps.PLACEHOLDER
+        response:
+          unauthenticated:
+            code: 401
+            headers:
+              WWW-Authenticate:
+                value: Bearer resource_metadata=https://mcp-gateway.apps.PLACEHOLDER/.well-known/oauth-protected-resource
+            body:
+              value: |
+                {"error":"Unauthorized","message":"Authentication required."}
 

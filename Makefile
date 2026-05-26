@@ -35,6 +35,11 @@ test:
 	@echo "Running tests..."
 	go test ./...
 
+# E2E: subprocess mcp-shield + httptest fake OpenShift token and MCP backend (requires network for loopback)
+test-e2e:
+	@echo "Running e2e tests..."
+	go test -tags=e2e -v ./tests/e2e/... -timeout=120s
+
 # Clean
 clean:
 	@echo "Cleaning..."
@@ -48,7 +53,8 @@ help:
 	@echo "  docker-build - Build the Docker image"
 	@echo "  docker-push  - Build and push the Docker image"
 	@echo "  run          - Build and run locally"
-	@echo "  test         - Run tests"
+	@echo "  test         - Run unit tests"
+	@echo "  test-e2e     - Run e2e tests (go test -tags=e2e)"
 	@echo "  clean        - Clean build artifacts"
 	@echo ""
 	@echo "Image configuration:"

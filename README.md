@@ -56,6 +56,9 @@ Supported MCP servers:
   - **If NOT detected as a gateway**: MCP Shield uses it as a regular fallback for all MCP requests (including tool calls). No direct routing is attempted, and requests are forwarded to the backend as-is
   - Example: `http://localhost:8080` (for sidecar in same pod) or `http://mcp-gateway:8080` (for gateway discovery)
   - See [Direct Tool Routing](./docs/direct-tool-routing.md) for details
+  - To send **all** MCP traffic through the gateway (no direct upstream `tools/call`), set `MCP_SHIELD_DIRECT_TOOL_ROUTING=false` — see [MCP Gateway integration](./docs/mcp-gateway-integration.md)
+
+- **`MCP_SHIELD_DIRECT_TOOL_ROUTING`** (optional): When `false`, `0`, `no`, or `off`, disables mcp-gateway `/status` discovery and sends every MCP request (including `tools/call`) to `MCP_BACKEND_URL` only. Default is on (`true`) for backward compatibility.
 
 - **`MCP_BACKEND_PATH`** (optional): Backend path endpoint to forward requests to
   - Defaults to `/mcp` if not set (for Prometheus MCP server)
@@ -95,6 +98,15 @@ docker push quay.io/<MY_USER>/mcp-shield:dev
 # Or use the Makefile
 make docker-push
 ```
+
+## Testing
+
+```bash
+make test       # unit tests (handlers, tokenstore, …)
+make test-e2e   # subprocess mcp-shield + httptest fake OpenShift token + MCP backend
+```
+
+E2E tests live under `tests/e2e/` and use the build tag `e2e` (`go test -tags=e2e ./tests/e2e/...`). They do not require a real OpenShift cluster.
 
 ## Running
 
@@ -170,11 +182,14 @@ docker run -p 8080:8080 \
 
 ## Usage
 
+**OpenShift (user token → Prometheus / Loki):** see the opinionated checklist and object list in [OpenShift user pattern](./docs/openshift-user-pattern.md) and the indexed [examples/](./examples/README.md).
+
 MCP Shield is designed to run as a sidecar container alongside your MCP server. Detailed deployment guides are available for each supported MCP server:
 
 - **[Prometheus MCP Server](docs/examples/prometheus-mcp-server.md)** - Complete guide for deploying with prometheus-mcp-server
 - **[Loki MCP Server](docs/examples/loki-mcp-server.md)** - Complete guide for deploying with loki-mcp-server
-- **[Kubernetes MCP Server](docs/examples/kubernetes-mcp-server.md)** - Complete guide for deploying with kubernetes-mcp-server
+- **[Kubernetes MCP Server](docs/examples/kubernetes-mcp-server.md)** - Shield sidecar with `cluster_auth_mode = passthrough` (per-user OpenShift OAuth)
+- **[Helm deployment planning](docs/helm-deployment.md)** - When to use examples vs kubernetes-mcp-server chart vs a future Shield chart
 - **[MCP Gateway](docs/examples/mcp-gateway.md)** - Complete guide for deploying with mcp-gateway
 
 ### MCP Server Endpoint Differences
@@ -315,7 +330,9 @@ The proxy token system provides an important security layer:
 6. When agentic CLI clients make MCP requests, MCP Shield exchanges the proxy token for the real token
 7. Real token is only used server-side and never exposed to the client
 
-## Comparisons
+## Comparisons and gateway notes
+
+For mcp-gateway placement, direct vs through-gateway routing, and [Kuadrant/mcp-gateway#414](https://github.com/Kuadrant/mcp-gateway/issues/414), see [MCP Gateway integration](./docs/mcp-gateway-integration.md).
 
 For detailed comparisons with alternative solutions, see [Comparisons](docs/comparisons.md), which covers:
 - **Why not use the official OpenShift oauth-proxy?** - Differences in authentication methods, OAuth discovery endpoints, and use cases

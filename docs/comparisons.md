@@ -160,7 +160,7 @@ When using MCP Shield with mcp-gateway:
 - This provides the best of both worlds: multi-server aggregation (mcp-gateway) + complete OAuth flow handling (MCP Shield) + direct tool routing for performance
 - **Important**: Do not configure static credentials for backend servers in mcp-gateway when using MCP Shield, as the dynamic Authorization header from MCP Shield should be used instead
 
-See the [MCP Gateway deployment guide](examples/mcp-gateway.md) and [Direct Tool Routing documentation](direct-tool-routing.md) for details on deploying MCP Shield with mcp-gateway.
+See the [MCP Gateway deployment guide](examples/mcp-gateway.md), [Direct Tool Routing documentation](direct-tool-routing.md), and [MCP Gateway integration](mcp-gateway-integration.md) (including `MCP_SHIELD_DIRECT_TOOL_ROUTING=false` and [mcp-gateway#414](https://github.com/Kuadrant/mcp-gateway/issues/414)) for details on deploying MCP Shield with mcp-gateway.
 
 ### Summary
 

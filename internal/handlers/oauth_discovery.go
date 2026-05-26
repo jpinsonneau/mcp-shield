@@ -186,10 +186,9 @@ func (odh *OAuthDiscoveryHandler) HandleOAuthStart(w http.ResponseWriter, r *htt
 	// Check if PKCE is being used (code_challenge parameter present)
 	usingPKCE := queryParams.Has("code_challenge")
 
-	// If the redirect_uri is a localhost URL, we need to intercept it
-	// Store the original redirect_uri in the state parameter and use our fixed callback
-	if originalRedirectURI != "" && strings.HasPrefix(originalRedirectURI, "http://localhost:") {
-		odh.Logger.Info("Intercepting localhost redirect URI", "original_redirect_uri", originalRedirectURI)
+	// If redirect_uri is loopback http, intercept: OpenShift cannot use dynamic localhost ports.
+	if originalRedirectURI != "" && isLoopbackRedirectURI(originalRedirectURI) {
+		odh.Logger.Info("Intercepting loopback redirect URI", "original_redirect_uri", originalRedirectURI)
 
 		// Append the original redirect_uri to the state parameter
 		originalState := queryParams.Get("state")

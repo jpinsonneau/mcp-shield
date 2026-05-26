@@ -72,6 +72,8 @@ Also configure environment variables in the MCP Shield container:
 
 **Note**: MCP Gateway runs on port 8080 for HTTP (broker) and port 50051 for gRPC (router). MCP Shield will proxy requests to the gateway's `/mcp` endpoint.
 
+The broker container must set **`JWT_SESSION_SIGNING_KEY`** (environment variable used by `mcp_gateway`); the example manifest includes a dev placeholder — use a `Secret` in production. The flag **`--mcp-broker-config-address`** was removed in current mcp-gateway releases; do not pass it.
+
 ### Step 3: Create the OAuth Client
 
 Create an OAuthClient in OpenShift that matches your deployment:

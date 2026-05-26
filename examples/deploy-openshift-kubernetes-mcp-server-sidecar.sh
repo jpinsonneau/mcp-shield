@@ -23,6 +23,7 @@ NAMESPACE="default"
 OAUTH_CLIENT_ID="kubernetes-mcp-server"
 SERVICE_NAME="kubernetes-mcp-server"
 MCP_SHIELD_IMAGE="${MCP_SHIELD_IMAGE:-quay.io/jpinsonn/mcp-shield:dev}"
+KUBERNETES_MCP_SERVER_IMAGE="${KUBERNETES_MCP_SERVER_IMAGE:-quay.io/containers/kubernetes_mcp_server:latest}"
 CREATE_ROUTE=true
 
 # Function to print colored output
@@ -88,6 +89,10 @@ replace_placeholders() {
     if [ "$MCP_SHIELD_IMAGE" != "quay.io/jpinsonn/mcp-shield:dev" ]; then
         sed -i "s|quay.io/jpinsonn/mcp-shield:dev|$MCP_SHIELD_IMAGE|g" /tmp/openshift-kubernetes-mcp-server-sidecar.yml
     fi
+
+    if [ "$KUBERNETES_MCP_SERVER_IMAGE" != "quay.io/containers/kubernetes_mcp_server:latest" ]; then
+        sed -i "s|quay.io/containers/kubernetes_mcp_server:latest|$KUBERNETES_MCP_SERVER_IMAGE|g" /tmp/openshift-kubernetes-mcp-server-sidecar.yml
+    fi
     
     print_status "Placeholders replaced successfully."
 }
@@ -95,18 +100,36 @@ replace_placeholders() {
 # Create OAuth Client
 create_oauth_client() {
     print_step "Creating OAuth Client..."
+
+    local need_svc need_route
+    need_svc="https://${SERVICE_NAME}.${NAMESPACE}.svc:8081/oauth/callback"
+    need_route="https://${SERVICE_NAME}.apps.${CLUSTER_DOMAIN}/oauth/callback"
     
     # Check if OAuthClient already exists
-    if oc get oauthclient "$OAUTH_CLIENT_ID" >/dev/null 2>&1; then
+    if oc get oauthclient "$OAUTH_CLIENT_ID" &>/dev/null; then
         print_warning "OAuthClient '$OAUTH_CLIENT_ID' already exists. Skipping creation."
-        print_status "If you need to update it, delete it first: oc delete oauthclient $OAUTH_CLIENT_ID"
+        local uris missing=0
+        uris=$(oc get oauthclient "$OAUTH_CLIENT_ID" -o jsonpath='{.redirectURIs[*]}' 2>/dev/null || true)
+        if ! printf '%s' "$uris" | grep -qF "$need_route"; then
+            print_warning "Existing OAuthClient is missing redirect URI (browser OAuth): $need_route"
+            missing=1
+        fi
+        if ! printf '%s' "$uris" | grep -qF "$need_svc"; then
+            print_warning "Existing OAuthClient is missing redirect URI (in-cluster): $need_svc"
+            missing=1
+        fi
+        if [ "$missing" -eq 1 ]; then
+            print_status "Fix: oc delete oauthclient $OAUTH_CLIENT_ID && re-run, or oc edit oauthclient $OAUTH_CLIENT_ID"
+        else
+            print_status "Existing redirect URIs look compatible with this deploy."
+        fi
         return
     fi
     
     # Build redirect URIs
     REDIRECT_URIS=(
-        "https://${SERVICE_NAME}.${NAMESPACE}.svc:8081/oauth/callback"
-        "https://${SERVICE_NAME}.apps.${CLUSTER_DOMAIN}/oauth/callback"
+        "$need_svc"
+        "$need_route"
     )
     
     # Create OAuthClient
@@ -149,9 +172,8 @@ create_route() {
     
     print_step "Creating Route..."
     
-    # Check if route already exists
     if oc get route "$SERVICE_NAME" -n "$NAMESPACE" >/dev/null 2>&1; then
-        print_warning "Route '$SERVICE_NAME' already exists. Skipping creation."
+        print_warning "Route '$SERVICE_NAME' already exists (manifest or prior run). Skipping oc create route."
         return
     fi
     
@@ -194,9 +216,8 @@ get_deployment_info() {
         print_status "OAuth Client ID: $OAUTH_CLIENT_ID"
         print_status "Namespace: $NAMESPACE"
         print_status ""
-        print_status "Note: All Kubernetes API operations use the user's OAuth token from the"
-        print_status "Authorization header. The ServiceAccount has no special permissions needed."
-        print_status "User permissions are determined by their OpenShift OAuth token."
+        print_status "Auth: cluster_auth_mode=passthrough (ConfigMap). API calls use each user's OAuth token."
+        print_status "MCP URL for clients: https://${ROUTE_URL}/mcp"
         print_status "═══════════════════════════════════════════════════════════"
     else
         print_warning "Route not found. Service may not be accessible from outside the cluster."
@@ -231,6 +252,8 @@ cleanup_deployment() {
     
     # Delete service account
     oc delete serviceaccount "$SERVICE_NAME" -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
+
+    oc delete configmap kubernetes-mcp-server-config -n "$NAMESPACE" --ignore-not-found=true 2>/dev/null || true
     
     # Delete OAuthClient
     print_status "Deleting OAuthClient..."
@@ -301,12 +324,15 @@ Options:
   --client-id ID            OAuth client ID (default: kubernetes-mcp-server)
   --service-name NAME       Service name (default: kubernetes-mcp-server)
   --mcp-shield-image IMG     MCP Shield image (default: quay.io/jpinsonn/mcp-shield:dev)
-  --no-route                Don't create a Route (default: create route)
+  --kubernetes-mcp-image IMG kubernetes-mcp-server image (default: quay.io/containers/kubernetes_mcp_server:latest)
+  --no-route                Don't create a Route (default: create route; manifest includes a Route)
   --cleanup                 Clean up the deployment
   --help                    Show this help message
 
 Environment Variables:
-  CLUSTER_DOMAIN            Override cluster domain detection
+  CLUSTER_DOMAIN              Override cluster domain detection
+  KUBERNETES_MCP_SERVER_IMAGE Override kubernetes-mcp-server container image
+  MCP_SHIELD_IMAGE            Override MCP Shield container image
 
 Examples:
   $0                                    # Deploy with defaults
@@ -334,6 +360,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         --mcp-shield-image)
             MCP_SHIELD_IMAGE="$2"
+            shift 2
+            ;;
+        --kubernetes-mcp-image)
+            KUBERNETES_MCP_SERVER_IMAGE="$2"
             shift 2
             ;;
         --no-route)

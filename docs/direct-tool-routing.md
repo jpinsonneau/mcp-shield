@@ -49,9 +49,19 @@ Client → mcp-shield → mcp-gateway (for auth/authz, optional)
 
 ## Configuration
 
+### Disabling direct routing (through-gateway only)
+
+Set:
+
+```bash
+MCP_SHIELD_DIRECT_TOOL_ROUTING=false
+```
+
+When disabled, MCP Shield **does not** query mcp-gateway `/status` or route `tools/call` to discovered upstreams. All MCP JSON-RPC goes to `MCP_BACKEND_URL` (after proxy-token exchange). Use this for maximum compatibility with mcp-gateway at the cost of extra latency. See [mcp-gateway-integration.md](./mcp-gateway-integration.md).
+
 ### Automatic Discovery from mcp-gateway
 
-MCP Shield automatically detects if `MCP_BACKEND_URL` points to an mcp-gateway instance by calling its `/status` endpoint. If detected, it automatically discovers upstream servers:
+When direct routing is **enabled** (default), MCP Shield automatically detects if `MCP_BACKEND_URL` points to an mcp-gateway instance by calling its `/status` endpoint. If detected, it automatically discovers upstream servers:
 
 ```bash
 MCP_BACKEND_URL="http://mcp-gateway:8080"

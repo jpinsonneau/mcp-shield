@@ -33,6 +33,8 @@ func main() {
 
 	logger.Info("Starting MCP Shield", "listen", *listenAddr)
 
+	directToolRouting := handlers.IsDirectToolRoutingEnabled()
+
 	// Create HTTP mux
 	mux := http.NewServeMux()
 
@@ -56,7 +58,7 @@ func main() {
 	// It will automatically update ToolRouter when servers are discovered
 	gatewayDiscoverer := handlers.NewGatewayDiscoverer(logger, backendURL, func(servers map[string]*handlers.UpstreamServer) {
 		toolRouter.UpdateUpstreamServers(servers)
-	})
+	}, directToolRouting)
 
 	mcpProxyHandler := handlers.NewMCPProxyHandler(logger, oauthTokenHandler.GetTokenStore())
 	mcpProxyHandler.ToolRouter = toolRouter

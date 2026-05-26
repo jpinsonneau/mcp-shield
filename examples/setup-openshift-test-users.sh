@@ -74,8 +74,106 @@ check_prerequisites() {
         print_status "On Ubuntu/Debian: sudo apt-get install apache2-utils"
         exit 1
     fi
+
+    # jq or python3: required to build the same JSON merge patch used for real updates and server-side dry-run
+    if ! command -v jq &> /dev/null && ! command -v python3 &> /dev/null; then
+        print_error "jq or python3 is required to build OAuth merge patches."
+        print_status "On Fedora/RHEL: sudo dnf install jq   (or: python3)"
+        print_status "On Ubuntu/Debian: sudo apt-get install jq"
+        exit 1
+    fi
     
     print_status "Prerequisites check passed."
+}
+
+# Write /tmp/oauth-spec-patch.json: current identityProviders minus $IDENTITY_PROVIDER_NAME, then append htpasswd IdP.
+write_oauth_htpasswd_merge_patch_json() {
+    if ! oc get oauth cluster -o json > /tmp/oauth-current.json 2>/dev/null; then
+        print_error "Cannot read oauth cluster."
+        return 1
+    fi
+    if command -v jq &> /dev/null; then
+        jq --arg name "$IDENTITY_PROVIDER_NAME" --arg secret "$SECRET_NAME" '
+            ((.spec // {}).identityProviders // []) as $all |
+            ($all | map(select(.name != $name))) as $filtered |
+            ($filtered + [{
+                name: $name,
+                type: "HTPasswd",
+                htpasswd: { fileData: { name: $secret } },
+                mappingMethod: "claim"
+            }]) as $out |
+            { spec: { identityProviders: $out } }
+        ' /tmp/oauth-current.json > /tmp/oauth-spec-patch.json
+        return 0
+    fi
+    if command -v python3 &> /dev/null; then
+        IDENTITY_PROVIDER_NAME="$IDENTITY_PROVIDER_NAME" SECRET_NAME="$SECRET_NAME" python3 <<'PY'
+import json
+import os
+
+ident = os.environ["IDENTITY_PROVIDER_NAME"]
+secret = os.environ["SECRET_NAME"]
+with open("/tmp/oauth-current.json", "r", encoding="utf-8") as f:
+    oauth = json.load(f)
+spec = oauth.setdefault("spec", {})
+idps = [p for p in (spec.get("identityProviders") or []) if p.get("name") != ident]
+idps.append({
+    "name": ident,
+    "type": "HTPasswd",
+    "htpasswd": {"fileData": {"name": secret}},
+    "mappingMethod": "claim",
+})
+with open("/tmp/oauth-spec-patch.json", "w", encoding="utf-8") as f:
+    json.dump({"spec": {"identityProviders": idps}}, f)
+PY
+        return 0
+    fi
+    print_error "jq or python3 is required."
+    return 1
+}
+
+# After oauth/cluster IdP setup fails (e.g. HCP), point at MCP deploy (OAuthClient CR is separate from oauth/cluster).
+print_mcp_gateway_deploy_hint() {
+    local here
+    here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+    print_status "MCP Gateway + Shield use an OAuthClient (oauth.openshift.io), not oauth/cluster IdPs."
+    print_status "The deploy script registers redirect URIs for YOUR Route host; do not reuse another cluster OAuthClient unless its redirectURIs match exactly."
+    print_status "Deploy from examples (default client id mcp-gateway; override only if an admin pre-created a matching OAuthClient):"
+    print_status "  cd \"$here\" && ./deploy-openshift-mcp-gateway-sidecar.sh"
+    print_status "  cd \"$here\" && ./deploy-openshift-mcp-gateway-sidecar.sh --client-id YOUR_NAME   # only if redirectURIs include https://<same-service>.apps.<cluster>/oauth/callback"
+    print_status ""
+}
+
+# Same merge patch as configure_oauth, with oc patch --dry-run=server (empty merge {} often skips admission; real spec does not).
+check_oauth_htpasswd_merge_patch_dry_run() {
+    print_status "Server-side dry-run: oauth/cluster must accept the htpasswd IdP merge patch..."
+    if ! oc get oauth cluster &>/dev/null; then
+        print_error "Cannot read oauth cluster resource."
+        return 1
+    fi
+    if ! write_oauth_htpasswd_merge_patch_json; then
+        return 1
+    fi
+    local err rc
+    err=$(oc patch oauth cluster --type=merge --patch-file=/tmp/oauth-spec-patch.json --dry-run=server 2>&1)
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        print_status "Dry-run succeeded; this cluster allows this OAuth update."
+        return 0
+    fi
+    print_error "OAuth merge patch was rejected (ROSA HCP / HyperShift ValidatingAdmissionPolicy, validation, etc.)."
+    print_status "This script cannot add an htpasswd identity provider here if the control plane blocks oauth/cluster updates."
+    print_status ""
+    print_status "What to do instead:"
+    print_status "  - Use identities from an IdP already configured on the cluster for MCP OAuth."
+    print_status "  - On hosted offerings, configure IdPs via your platform (OCM / HostedCluster / administrator), not oc patch oauth."
+    print_status "  - For unrestricted oauth/cluster edits, use a self-managed cluster (IPI, CRC, etc.)."
+    print_status ""
+    print_status "Server response (truncated):"
+    echo "$err" | head -c 1200 | sed 's/^/  /'
+    print_status ""
+    print_mcp_gateway_deploy_hint
+    return 1
 }
 
 # Create htpasswd file
@@ -188,100 +286,20 @@ create_secret() {
 # Configure OAuth identity provider
 configure_oauth() {
     print_step "Configuring OAuth identity provider..."
-    
-    # Check if identity provider already exists
-    if oc get oauth cluster -o jsonpath='{.spec.identityProviders[*].name}' 2>/dev/null | grep -q "$IDENTITY_PROVIDER_NAME"; then
-        print_warning "Identity provider '$IDENTITY_PROVIDER_NAME' already exists."
-        print_status "Removing existing identity provider..."
-        remove_identity_provider
-    fi
-    
-    # Get current OAuth configuration
+
     print_status "Reading current OAuth configuration..."
     oc get oauth cluster -o yaml > /tmp/oauth-backup.yaml
     print_status "OAuth configuration backed up to /tmp/oauth-backup.yaml"
-    
-    # Get current OAuth and add the new identity provider
-    print_status "Adding htpasswd identity provider..."
-    oc get oauth cluster -o yaml > /tmp/oauth-current.yaml
-    
-    # Use python or yq to merge (prefer yq as it's more reliable for YAML)
-    if command -v yq &> /dev/null; then
-        # Check if identityProviders exists, if not create empty array
-        if ! yq eval '.spec.identityProviders' /tmp/oauth-current.yaml > /dev/null 2>&1; then
-            yq eval '.spec.identityProviders = []' -i /tmp/oauth-current.yaml
-        fi
-        # Add the new identity provider to the existing list
-        yq eval '.spec.identityProviders += [{"name": "'"$IDENTITY_PROVIDER_NAME"'", "type": "HTPasswd", "htpasswd": {"fileData": {"name": "'"$SECRET_NAME"'"}}, "mappingMethod": "claim"}]' -i /tmp/oauth-current.yaml
-        # Extract just the spec.identityProviders array to patch
-        yq eval '{"spec": {"identityProviders": .spec.identityProviders}}' /tmp/oauth-current.yaml > /tmp/oauth-spec-patch.yaml
-        oc patch oauth cluster --type=merge --patch-file=/tmp/oauth-spec-patch.yaml
-    elif command -v python3 &> /dev/null; then
-        python3 <<PYTHON
-import yaml
-import sys
 
-# Read current OAuth
-with open('/tmp/oauth-current.yaml', 'r') as f:
-    oauth = yaml.safe_load(f)
+    print_status "Building merge patch (replace existing '$IDENTITY_PROVIDER_NAME' entry if present, then add htpasswd IdP)..."
+    if ! write_oauth_htpasswd_merge_patch_json; then
+        return 1
+    fi
 
-# Ensure spec.identityProviders exists
-if 'spec' not in oauth:
-    oauth['spec'] = {}
-if 'identityProviders' not in oauth['spec']:
-    oauth['spec']['identityProviders'] = []
-
-# Check if provider already exists
-provider_names = [p.get('name') for p in oauth['spec']['identityProviders']]
-if '$IDENTITY_PROVIDER_NAME' not in provider_names:
-    # Add new identity provider
-    oauth['spec']['identityProviders'].append({
-        'name': '$IDENTITY_PROVIDER_NAME',
-        'type': 'HTPasswd',
-        'htpasswd': {
-            'fileData': {
-                'name': '$SECRET_NAME'
-            }
-        },
-        'mappingMethod': 'claim'
-    })
-
-# Create patch with just spec.identityProviders (preserve all providers)
-patch = {
-    'spec': {
-        'identityProviders': oauth['spec']['identityProviders']
-    }
-}
-
-with open('/tmp/oauth-spec-patch.yaml', 'w') as f:
-    yaml.dump(patch, f, default_flow_style=False, sort_keys=False)
-
-PYTHON
-        if [ -f /tmp/oauth-spec-patch.yaml ]; then
-            oc patch oauth cluster --type=merge --patch-file=/tmp/oauth-spec-patch.yaml
-        else
-            print_error "Failed to create OAuth spec patch."
-            print_status "Please manually add the identity provider:"
-            print_status "  oc edit oauth cluster"
-            return 1
-        fi
-    else
-        print_error "Neither yq nor python3 found. Please install one of them."
-        print_status "On Fedora/RHEL: sudo dnf install yq python3-pyyaml"
-        print_status "On Ubuntu/Debian: sudo apt-get install yq python3-yaml"
-        print_status ""
-        print_status "Alternatively, you can manually add the identity provider:"
-        print_status "  oc edit oauth cluster"
-        print_status ""
-        print_status "Add this to spec.identityProviders:"
-        cat <<EOF
-  - name: $IDENTITY_PROVIDER_NAME
-    type: HTPasswd
-    htpasswd:
-      fileData:
-        name: $SECRET_NAME
-    mappingMethod: claim
-EOF
+    print_status "Applying OAuth configuration..."
+    if ! oc patch oauth cluster --type=merge --patch-file=/tmp/oauth-spec-patch.json; then
+        print_error "Failed to patch oauth cluster."
+        print_status "If the error mentions HostedCluster or ValidatingAdmissionPolicy, this cluster blocks oauth updates from this API."
         return 1
     fi
     
@@ -298,60 +316,68 @@ EOF
     fi
 }
 
+# Merge patch JSON: drop identity provider named $IDENTITY_PROVIDER_NAME only.
+write_oauth_remove_identity_merge_patch_json() {
+    if ! oc get oauth cluster -o json > /tmp/oauth-current.json 2>/dev/null; then
+        print_error "Cannot read oauth cluster."
+        return 1
+    fi
+    if command -v jq &> /dev/null; then
+        jq --arg n "$IDENTITY_PROVIDER_NAME" '
+            .spec //= {} |
+            .spec.identityProviders //= [] |
+            { spec: { identityProviders: [.spec.identityProviders[] | select(.name != $n)] } }
+        ' /tmp/oauth-current.json > /tmp/oauth-spec-patch.json
+        return 0
+    fi
+    if command -v python3 &> /dev/null; then
+        IDENTITY_PROVIDER_NAME="$IDENTITY_PROVIDER_NAME" python3 <<'PY'
+import json
+import os
+
+ident = os.environ["IDENTITY_PROVIDER_NAME"]
+with open("/tmp/oauth-current.json", "r", encoding="utf-8") as f:
+    oauth = json.load(f)
+spec = oauth.get("spec") or {}
+idps = [p for p in (spec.get("identityProviders") or []) if p.get("name") != ident]
+with open("/tmp/oauth-spec-patch.json", "w", encoding="utf-8") as f:
+    json.dump({"spec": {"identityProviders": idps}}, f)
+PY
+        return 0
+    fi
+    print_error "jq or python3 is required."
+    return 1
+}
+
 # Remove identity provider
 remove_identity_provider() {
     print_status "Removing identity provider '$IDENTITY_PROVIDER_NAME'..."
-    
-    # Get current identity providers
+
     CURRENT_PROVIDERS=$(oc get oauth cluster -o jsonpath='{.spec.identityProviders[*].name}' 2>/dev/null || echo "")
-    
-    if echo "$CURRENT_PROVIDERS" | grep -q "$IDENTITY_PROVIDER_NAME"; then
-        # Remove the identity provider by filtering it out
-        oc get oauth cluster -o json > /tmp/oauth-current.json
-        
-        # Use jq or python to remove the identity provider
-        if command -v jq &> /dev/null; then
-            # Extract just the spec with the provider removed
-            jq '{"spec": {identityProviders: [.spec.identityProviders[] | select(.name != "'"$IDENTITY_PROVIDER_NAME"'")]}}' /tmp/oauth-current.json > /tmp/oauth-spec-patch.json
-            oc patch oauth cluster --type=merge --patch-file=/tmp/oauth-spec-patch.json
-        elif command -v python3 &> /dev/null; then
-            python3 <<PYTHON
-import json
-import sys
-
-with open('/tmp/oauth-current.json', 'r') as f:
-    oauth = json.load(f)
-
-# Extract spec and remove the identity provider
-spec = oauth.get('spec', {})
-if 'identityProviders' in spec:
-    spec['identityProviders'] = [
-        p for p in spec['identityProviders']
-        if p.get('name') != '$IDENTITY_PROVIDER_NAME'
-    ]
-
-# Create patch with just the spec
-patch = {'spec': spec}
-
-with open('/tmp/oauth-spec-patch.json', 'w') as f:
-    json.dump(patch, f, indent=2)
-PYTHON
-            if [ -f /tmp/oauth-spec-patch.json ]; then
-                oc patch oauth cluster --type=merge --patch-file=/tmp/oauth-spec-patch.json
-            else
-                print_error "Failed to create OAuth spec patch."
-                return 1
-            fi
-        else
-            print_error "Neither jq nor python3 found. Please install one to remove the identity provider."
-            print_status "You can manually edit the OAuth resource: oc edit oauth cluster"
-            return 1
-        fi
-        
-        print_status "Identity provider removed."
-    else
+    if ! echo "$CURRENT_PROVIDERS" | grep -q "$IDENTITY_PROVIDER_NAME"; then
         print_status "Identity provider '$IDENTITY_PROVIDER_NAME' not found."
+        return 0
     fi
+
+    if ! write_oauth_remove_identity_merge_patch_json; then
+        return 1
+    fi
+
+    local dry_out rc
+    dry_out=$(oc patch oauth cluster --type=merge --patch-file=/tmp/oauth-spec-patch.json --dry-run=server 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        print_warning "Skipping OAuth identity provider removal (server rejected dry-run):"
+        echo "$dry_out" | head -c 800 | sed 's/^/  /'
+        return 0
+    fi
+
+    if ! oc patch oauth cluster --type=merge --patch-file=/tmp/oauth-spec-patch.json; then
+        print_error "Failed to remove identity provider from oauth cluster."
+        return 1
+    fi
+
+    print_status "Identity provider removed."
 }
 
 # Wait for OAuth server to be ready
@@ -555,6 +581,9 @@ main() {
     check_prerequisites
     create_htpasswd_file
     create_secret
+    if ! check_oauth_htpasswd_merge_patch_dry_run; then
+        exit 1
+    fi
     configure_oauth
     wait_for_oauth
     grant_user_roles
@@ -597,6 +626,11 @@ Prerequisites:
   - OpenShift CLI (oc) installed and logged in
   - Cluster-admin permissions (or ability to modify OAuth and Secrets)
   - htpasswd command available (apache2-utils or httpd-tools)
+  - jq or python3 (to build the OAuth JSON merge patch used for dry-run and apply)
+
+Not supported (script exits after server-side dry-run of the real OAuth merge patch):
+  - Clusters where oauth/cluster updates are denied (e.g. ROSA HCP / HyperShift). An empty oc patch is often a no-op
+    and bypasses admission; this script dry-runs the same spec.identityProviders merge used for the real apply.
 
 Examples:
   $0                      # Create test users with roles

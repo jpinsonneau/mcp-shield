@@ -23,8 +23,10 @@ type GatewayDiscoverer struct {
 	onServersUpdate func(servers map[string]*UpstreamServer) // Callback when servers are discovered/updated
 }
 
-// NewGatewayDiscoverer creates a new gateway discoverer
-func NewGatewayDiscoverer(logger *slog.Logger, backendURL string, onServersUpdate func(servers map[string]*UpstreamServer)) *GatewayDiscoverer {
+// NewGatewayDiscoverer creates a new gateway discoverer.
+// When discoverGatewayUpstream is false, mcp-gateway detection and periodic /status discovery are skipped
+// (all MCP requests should use MCP_BACKEND_URL only; see MCP_SHIELD_DIRECT_TOOL_ROUTING).
+func NewGatewayDiscoverer(logger *slog.Logger, backendURL string, onServersUpdate func(servers map[string]*UpstreamServer), discoverGatewayUpstream bool) *GatewayDiscoverer {
 	discoverer := &GatewayDiscoverer{
 		logger:          logger,
 		gatewayURL:      "",
@@ -34,6 +36,12 @@ func NewGatewayDiscoverer(logger *slog.Logger, backendURL string, onServersUpdat
 		},
 		stopDiscovery:   make(chan struct{}),
 		onServersUpdate: onServersUpdate,
+	}
+
+	if !discoverGatewayUpstream {
+		logger.Info("mcp-gateway upstream discovery disabled; all MCP traffic uses MCP_BACKEND_URL only",
+			"env", envDirectToolRouting)
+		return discoverer
 	}
 
 	// Try to detect if backend is mcp-gateway

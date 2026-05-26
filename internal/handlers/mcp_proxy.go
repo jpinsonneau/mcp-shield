@@ -18,13 +18,14 @@ import (
 
 // MCPProxyHandler handles proxying requests to the MCP server
 type MCPProxyHandler struct {
-	Logger            *slog.Logger
-	MCPBackend        string                 // Backend MCP server URL (e.g., "http://localhost:8080") - fallback if no routing
-	BackendPath       string                 // Backend path to forward to (e.g., "/mcp" or "/stream")
-	TokenStore        *tokenstore.TokenStore // Token store for proxy token exchange
-	ToolRouter        *ToolRouter            // Tool router for direct upstream routing
-	GatewayDiscoverer *GatewayDiscoverer     // Gateway discoverer for gateway detection
-	httpClient        *http.Client
+	Logger                   *slog.Logger
+	MCPBackend               string                 // Backend MCP server URL (e.g., "http://localhost:8080") - fallback if no routing
+	BackendPath              string                 // Backend path to forward to (e.g., "/mcp" or "/stream")
+	TokenStore               *tokenstore.TokenStore // Token store for proxy token exchange
+	ToolRouter               *ToolRouter            // Tool router for direct upstream routing
+	GatewayDiscoverer        *GatewayDiscoverer     // Gateway discoverer for gateway detection
+	directToolRoutingEnabled bool                   // when false, tools/call always uses MCPBackend (through-gateway mode)
+	httpClient               *http.Client
 }
 
 // NewMCPProxyHandler creates a new MCPProxyHandler
@@ -44,12 +45,18 @@ func NewMCPProxyHandler(logger *slog.Logger, tokenStore *tokenstore.TokenStore) 
 		logger.Info("Using configured MCP_BACKEND_PATH", "path", backendPath)
 	}
 
+	direct := IsDirectToolRoutingEnabled()
+	if !direct {
+		logger.Info("direct tool routing disabled; tools/call will use MCP_BACKEND_URL only", "env", envDirectToolRouting)
+	}
+
 	return &MCPProxyHandler{
-		Logger:      logger,
-		MCPBackend:  mcpBackend,
-		BackendPath: backendPath,
-		TokenStore:  tokenStore,
-		httpClient:  &http.Client{
+		Logger:                   logger,
+		MCPBackend:               mcpBackend,
+		BackendPath:              backendPath,
+		TokenStore:               tokenStore,
+		directToolRoutingEnabled: direct,
+		httpClient:               &http.Client{
 			// No timeout set - let the client handle timeouts
 		},
 	}
@@ -107,41 +114,54 @@ func (mph *MCPProxyHandler) Handle(w http.ResponseWriter, r *http.Request) {
 								toolName = name
 								mph.Logger.Info("Detected tool call", "tool_name", toolName)
 
-								// Try to route directly to upstream server
-								routingResult, err := tryDirectRouting(
-									mph.Logger,
-									mph.ToolRouter,
-									toolName,
-									jsonRPC,
-									requestBody,
-									authHeader,
-									mph.TokenStore,
-									r.Context(),
-								)
-
-								if err != nil {
-									mph.Logger.Warn("Error during direct routing attempt", "error", err)
-									// Fall through to fallback
-								}
-
-								if routingResult != nil && routingResult.Success {
-									upstreamURL = routingResult.UpstreamURL
-									upstreamSessionID = routingResult.UpstreamSessionID
-									modifiedBody = routingResult.ModifiedBody
-									sessionEstablished = true
-								} else {
-									// Direct routing failed or not available - use fallback
-									mph.Logger.Debug("Using fallback backend for tool call", "tool_name", toolName)
+								if !mph.directToolRoutingEnabled {
+									mph.Logger.Debug("direct tool routing disabled, forwarding tool call via MCP_BACKEND_URL",
+										"tool_name", toolName, "env", envDirectToolRouting)
 									upstreamURL = ""
 									upstreamSessionID = ""
 									sessionEstablished = false
 									modifiedBody = requestBody
-									// Re-parse JSON to get a clean copy for session ID injection
 									if parseErr := json.Unmarshal(requestBody, &jsonRPC); parseErr != nil {
-										mph.Logger.Warn("Failed to re-parse JSON after routing failure", "error", parseErr)
+										mph.Logger.Warn("Failed to re-parse JSON for fallback tool call", "error", parseErr)
 										modifiedBody = requestBody
+									}
+								} else {
+									// Try to route directly to upstream server
+									routingResult, err := tryDirectRouting(
+										mph.Logger,
+										mph.ToolRouter,
+										toolName,
+										jsonRPC,
+										requestBody,
+										authHeader,
+										mph.TokenStore,
+										r.Context(),
+									)
+
+									if err != nil {
+										mph.Logger.Warn("Error during direct routing attempt", "error", err)
+										// Fall through to fallback
+									}
+
+									if routingResult != nil && routingResult.Success {
+										upstreamURL = routingResult.UpstreamURL
+										upstreamSessionID = routingResult.UpstreamSessionID
+										modifiedBody = routingResult.ModifiedBody
+										sessionEstablished = true
 									} else {
-										mph.Logger.Debug("Re-parsed JSON after routing failure to ensure clean state")
+										// Direct routing failed or not available - use fallback
+										mph.Logger.Debug("Using fallback backend for tool call", "tool_name", toolName)
+										upstreamURL = ""
+										upstreamSessionID = ""
+										sessionEstablished = false
+										modifiedBody = requestBody
+										// Re-parse JSON to get a clean copy for session ID injection
+										if parseErr := json.Unmarshal(requestBody, &jsonRPC); parseErr != nil {
+											mph.Logger.Warn("Failed to re-parse JSON after routing failure", "error", parseErr)
+											modifiedBody = requestBody
+										} else {
+											mph.Logger.Debug("Re-parsed JSON after routing failure to ensure clean state")
+										}
 									}
 								}
 							}
